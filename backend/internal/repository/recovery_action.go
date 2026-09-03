@@ -23,6 +23,14 @@ type RecoveryActionRepository interface {
 	// UNIQUE(idempotency_key) constraint) action for a logical execution.
 	// Used for the idempotency check before executing (Milestone 6).
 	GetByIdempotencyKey(ctx context.Context, idempotencyKey string) (*domain.RecoveryAction, error)
+	// GetByProviderReference looks up the (at most one, per the partial
+	// UNIQUE(provider, provider_reference) index — migration 000015) action
+	// for a given provider-side object reference. Used to correlate an
+	// inbound webhook/reconciliation lookup back to the RecoveryAction that
+	// caused it (Milestone 7) — the webhook itself proves its relationship
+	// to the provider-side object this way, rather than trusting any
+	// caller-supplied recovery_case_id.
+	GetByProviderReference(ctx context.Context, provider, providerReference string) (*domain.RecoveryAction, error)
 	// TryCreate inserts a unless an action with the same IdempotencyKey
 	// already exists (ON CONFLICT DO NOTHING), reporting created=false in
 	// that case. Never errors on conflict, so it never poisons the
@@ -102,6 +110,16 @@ func (r *PostgresRecoveryActionRepository) GetByIdempotencyKey(ctx context.Conte
 		FROM recovery_actions
 		WHERE idempotency_key = $1`
 	return r.scanOne(r.db.QueryRow(ctx, q, idempotencyKey))
+}
+
+func (r *PostgresRecoveryActionRepository) GetByProviderReference(ctx context.Context, provider, providerReference string) (*domain.RecoveryAction, error) {
+	const q = `
+		SELECT id, recovery_case_id, action_type, status, attempt_number,
+			idempotency_key, requested_at, executed_at, created_at,
+			provider, provider_reference, error_code, execution_metadata
+		FROM recovery_actions
+		WHERE provider = $1 AND provider_reference = $2`
+	return r.scanOne(r.db.QueryRow(ctx, q, provider, providerReference))
 }
 
 func (r *PostgresRecoveryActionRepository) ListByRecoveryCaseID(ctx context.Context, recoveryCaseID uuid.UUID) ([]*domain.RecoveryAction, error) {

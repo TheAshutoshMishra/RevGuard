@@ -98,4 +98,42 @@ var (
 	// ErrRecoveryCaseNotAllow means execution was requested for a
 	// RecoveryCase that is not currently ALLOW.
 	ErrRecoveryCaseNotAllow = errors.New("service: recovery case is not in ALLOW status")
+
+	// ErrInvalidWebhookSignature means a webhook request's signature was
+	// missing, malformed, or did not match the expected HMAC — including
+	// when no webhook secret is configured at all (fail-closed, never
+	// fail-open). No webhook payload is ever trusted or persisted when
+	// this error occurs.
+	ErrInvalidWebhookSignature = errors.New("service: invalid webhook signature")
+
+	// ErrMalformedWebhookPayload means a signature-verified webhook body
+	// could not be parsed into a normalized provider event.
+	ErrMalformedWebhookPayload = errors.New("service: malformed webhook payload")
+
+	// ErrRecoveryCaseNotVerifying means reconciliation was requested for
+	// a RecoveryCase that is not currently VERIFYING — either it hasn't
+	// reached that state yet, or financial truth has already been
+	// established (SUCCESS/FAILED), or it was never executed at all.
+	ErrRecoveryCaseNotVerifying = errors.New("service: recovery case is not in VERIFYING status")
+
+	// ErrNoRecoveryActionForCase means reconciliation was requested for a
+	// case that has no RecoveryAction to reconcile against.
+	ErrNoRecoveryActionForCase = errors.New("service: recovery case has no recovery action to reconcile")
+
+	// ErrNoProviderReferenceToReconcile means the RecoveryAction being
+	// reconciled has no ProviderReference — there is nothing to look up
+	// on the provider side (e.g. an execution that timed out before ever
+	// receiving a reference from the provider).
+	ErrNoProviderReferenceToReconcile = errors.New("service: recovery action has no provider reference to reconcile")
+
+	// ErrReconciliationReferenceNotFound means the provider reports it
+	// has no record of the given reference at all. Distinct from a
+	// transport/timeout error, but still not treated as ambiguous — it
+	// simply means reconciliation could not resolve UNKNOWN this time and
+	// the case remains unresolved.
+	ErrReconciliationReferenceNotFound = errors.New("service: provider reports no record of this reference")
+
+	// ErrUnknownReconciliationProvider means a PaymentReconciler was asked
+	// to reconcile a reference for a provider it does not implement.
+	ErrUnknownReconciliationProvider = errors.New("service: unknown reconciliation provider")
 )
