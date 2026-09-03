@@ -9,10 +9,10 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-// NewRouter builds the chi router for the backend service. events and
-// economicEvaluations may be nil in tests that don't exercise the
-// corresponding routes.
-func NewRouter(events eventProcessor, economicEvaluations economicEvaluationReader) http.Handler {
+// NewRouter builds the chi router for the backend service. events,
+// economicEvaluations, and policyDecisions may be nil in tests that
+// don't exercise the corresponding routes.
+func NewRouter(events eventProcessor, economicEvaluations economicEvaluationReader, policyDecisions policyDecisionReader) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.Logger)
@@ -21,6 +21,7 @@ func NewRouter(events eventProcessor, economicEvaluations economicEvaluationRead
 	r.Get("/health", handleHealth)
 	r.Post("/events", handleCreateEvent(events))
 	r.Get("/v1/recovery-cases/{id}/economic-evaluation", handleGetEconomicEvaluation(economicEvaluations))
+	r.Get("/v1/recovery-cases/{id}/policy-decision", handleGetPolicyDecision(policyDecisions))
 
 	return r
 }
