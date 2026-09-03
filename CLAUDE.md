@@ -50,7 +50,8 @@ backend/            Go core backend
                             state machine, RecoveryOrchestrator, EventPublisher,
                             RecoveryContextBuilder, AIClient, AnalysisOrchestrator,
                             EconomicEngine, RecoveryProbabilityEstimator, ActionEconomics,
-                            PolicyEngine, PolicyConfig, evaluatePolicyRules
+                            PolicyEngine, PolicyConfig, evaluatePolicyRules,
+                            ExecutionEngine, PaymentProvider (FakeProvider, RazorpayProvider)
   migrations/         SQL migrations (golang-migrate up/down pairs, one per table)
 ai-service/          Python FastAPI AI/ML/LLM service
   app/main.py         FastAPI app + /health + POST /v1/diagnose
@@ -63,7 +64,8 @@ deployments/         deployment configuration (future use)
 docs/architecture/   architecture notes/diagrams (event-flow.md: Milestone 2 pipeline;
                      ai-diagnosis.md: Milestone 3 AI diagnosis pipeline;
                      economic-engine.md: Milestone 4 economic evaluation pipeline;
-                     policy-engine.md: Milestone 5 policy decision pipeline)
+                     policy-engine.md: Milestone 5 policy decision pipeline;
+                     execution-engine.md: Milestone 6 execution pipeline)
 docs/decisions/      ADRs (0001: recovery probability vs. AI confidence, and why the
                      Economic Engine doesn't decide; 0002: why AI recommendation,
                      economic evaluation, and policy authorization are three
@@ -936,14 +938,285 @@ automatic human-approval workflows, manual override functionality. The
 `RecoveryAction` is ever created, in every test and in the manual
 verification above.
 
-### Milestone 6 — Execution Engine: NOT STARTED
+### Milestone 6 — Execution Engine: COMPLETE
 
-Not yet scoped. Do not begin implementation until explicitly instructed.
-Milestone 6 will read an `ALLOW` `PolicyDecision`'s `AuthorizedAction` and
-actually perform it (payment retry, payment link send, etc.) via
-Razorpay, transitioning `RecoveryCase` through `EXECUTING` ->
-`VERIFYING`. Do not implement payment execution, Razorpay integration, or
-webhooks until this milestone is explicitly started.
+Goal: turn an `ALLOW` `PolicyDecision` into a bounded, auditable
+execution attempt — create a `RecoveryAction`, execute the authorized
+action (only `retry_payment` in this milestone) via a `PaymentProvider`
+abstraction, and transition `RecoveryCase` through
+`ALLOW -> EXECUTING -> VERIFYING`. The engine never trusts a
+caller-supplied action, AI recommendation, or client request parameter —
+only the persisted `PolicyDecision.AuthorizedAction`, reloaded fresh from
+PostgreSQL. Full design rationale:
+[`docs/architecture/execution-engine.md`](./docs/architecture/execution-engine.md).
+
+- [x] **Domain**: `RecoveryAction` (`backend/internal/domain/recovery_action.go`)
+      gains `Provider`, `ProviderReference`, `ErrorCode` (plain strings,
+      `""` = unset, matching `PolicyDecision.AuthorizedAction`'s existing
+      convention) and `ExecutionMetadata []byte` (sanitized JSON, never a
+      raw provider response). `RecoveryActionStatus` gains `UNKNOWN` —
+      execution was attempted but its outcome could not be definitively
+      determined; never fabricated into `SUCCEEDED`/`FAILED`.
+- [x] **Migration `000015`** extends the existing `recovery_actions`
+      table (no new table, no modification of any prior migration): adds
+      `provider`, `provider_reference`, `error_code` (nullable),
+      `execution_metadata JSONB NOT NULL DEFAULT '{}'`, extends the
+      `status` `CHECK` with `UNKNOWN`, and adds a partial unique index
+      `(provider, provider_reference) WHERE provider_reference IS NOT NULL`.
+      `idempotency_key`'s pre-existing `UNIQUE` (Milestone 1) is reused
+      as-is for execution idempotency.
+- [x] **`PaymentProvider`** interface
+      (`backend/internal/service/payment_provider.go`): `Name() string`,
+      `RetryPayment(ctx, RetryPaymentRequest) (RetryPaymentResult, error)`.
+      A definitive outcome (success or failure) is `(result, nil)`; an
+      **ambiguous** outcome (timeout, transport failure) is a non-nil
+      `error` — mirrors `AIClient.Diagnose`'s error-vs-result split
+      (Milestone 3). `RetryPaymentRequest` carries no card data, CVV, or
+      credentials (nothing to leak — `domain.Payment` doesn't model
+      those fields).
+- [x] **`FakeProvider`** (`fake_payment_provider.go`): deterministic,
+      always `provider="fake"`, five scenarios (`success`,
+      `definitive_failure`, `unsupported`, `timeout`,
+      `transport_error`), atomic `InvocationCount()` for concurrency
+      assertions. The default provider (`PAYMENT_PROVIDER=fake`) unless
+      explicitly overridden.
+- [x] **`RazorpayProvider`** (`razorpay_provider.go`): a minimal,
+      honestly-scoped Razorpay Test Mode adapter. `retry_payment` is
+      mapped to creating a Payment Link (`POST /v1/payment_links`), not a
+      literal card re-charge — Razorpay's public API has no
+      server-to-server force-retry operation, and RBI regulation requires
+      customer re-authentication per charge; a `Succeeded` result here
+      means "a retry link was created," not "the payment succeeded."
+      Credentials (`RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`) come from
+      environment variables only, sent via HTTP Basic Auth, never
+      hardcoded or logged; construction fails fast if either is empty.
+      **NOT VERIFIED against a real Razorpay account** — see "Real
+      Razorpay verification" below.
+- [x] **`ExecutionEngine`** (`backend/internal/service/execution_engine.go`,
+      `Execute(ctx, recoveryCaseID, policyDecisionID)`): a 6-step
+      validation chain (decision exists -> belongs to the case -> is
+      `ALLOW` -> has a valid `AuthorizedAction` -> that action is
+      implemented (`retry_payment` only) -> the case is currently
+      `ALLOW`) before any side effect. Three phases: **Phase 1** (one
+      short transaction) validates, creates the `RecoveryAction`
+      (`EXECUTING`), transitions `ALLOW -> EXECUTING`, audits, commits;
+      **Phase 2** (no transaction open) calls the provider; **Phase 3**
+      (one short transaction) persists the result, transitions
+      `EXECUTING -> VERIFYING`, audits, commits. No transaction is ever
+      held open across the provider call.
+- [x] **Idempotency**: `RecoveryAction.IdempotencyKey =
+      "policy-decision:<policyDecisionID>"`, enforced by the existing
+      `UNIQUE` constraint via `TryCreate`
+      (`INSERT ... ON CONFLICT DO NOTHING`, no `SAVEPOINT` needed, same
+      pattern as Milestones 4–5). A found existing action is classified
+      as terminal (no-op), recently-`EXECUTING` (still genuinely in
+      flight — no-op, never call the provider again), or
+      stale-`EXECUTING` (>30s old, presumed abandoned/crashed — resolved
+      to `UNKNOWN` **without** calling the provider again, since we
+      cannot know whether the abandoned attempt ever reached it).
+- [x] **Timeout / ambiguous-outcome semantics**: a non-nil error from
+      `PaymentProvider.RetryPayment` (timeout, transport failure) is
+      **always** persisted as `RecoveryActionStatus = UNKNOWN`
+      (`error_code = PROVIDER_RESPONSE_AMBIGUOUS`), never guessed into
+      `SUCCEEDED` or `FAILED`, and never automatically retried. The case
+      still transitions to `VERIFYING` either way — it is never left
+      stuck in `EXECUTING`, and this engine never advances it to
+      `SUCCESS`/`FAILED` under any circumstance. `VERIFYING` is where the
+      case waits for Milestone 7.
+- [x] **Race safety**: the same READ-COMMITTED re-check pattern
+      documented for `PolicyEngine` below is proactively applied in
+      `phase1` — an idempotency re-check immediately before rejecting a
+      wrong-case-status error, closing the same class of race.
+- [x] **Read/write HTTP endpoint**:
+      `POST /v1/recovery-cases/{id}/execute`
+      (`backend/internal/http/execution.go`) — **empty request body**.
+      The handler resolves the case's latest `PolicyDecision`
+      server-side (reusing `policyDecisionReader.GetLatestDecision` from
+      Milestone 5) and passes its ID into `Execute`; there is no `action`
+      field anywhere in the request for a client to set, and no "force
+      execute" or override endpoint exists anywhere. Errors map to
+      404/422/500 without leaking raw errors; the response never
+      includes credentials or a raw provider response body.
+- [x] **Config**: `PAYMENT_PROVIDER` (`fake` default, or `razorpay`),
+      `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_BASE_URL` — all
+      read from environment variables in `backend/internal/config`,
+      wired in `cmd/server/main.go`'s `buildPaymentProvider`, which fails
+      fast on an unknown provider name or missing Razorpay credentials.
+- [x] **Bug found and fixed during this milestone (not a regression a
+      user reported)**: a genuine TOCTOU race in Milestone 5's
+      `PolicyEngine.Evaluate` — `TestPolicyEngine_ConcurrentEvaluationConvergesSafely`
+      failed intermittently (~30% of runs) with
+      `"recovery case is not in ANALYZED status"`. Root cause: under
+      PostgreSQL READ COMMITTED, each `SELECT` in a transaction sees a
+      fresh snapshot, so the idempotency check (no existing decision) and
+      the case-status check (now `ALLOW`) could straddle a concurrent
+      transaction's commit. Fixed by re-checking idempotency once more
+      immediately before erroring on wrong-state — verified with 30
+      consecutive stress runs (previously ~30% failure rate, now 0/30)
+      plus 3 full regression suite runs. The identical defensive pattern
+      was proactively built into `ExecutionEngine.phase1` from the start.
+- [x] Explicitly NOT implemented (by design, per milestone scope):
+      webhooks, webhook signature verification, reconciliation, payment
+      outcome finalization (`SUCCESS`/`FAILED` as trusted/durable),
+      automatic retry after an ambiguous result, analytics, customer
+      notification infrastructure, human approval workflow, policy admin
+      UI, any transition beyond `VERIFYING`. Execution is **not** wired
+      into `EventProcessor.Process` — it only ever runs via the explicit
+      `POST /execute` call, unlike Milestones 3–5's automatic pipeline.
+
+**Tests (all passing, `TEST_DATABASE_URL` set for the integration
+subset):**
+- `fake_payment_provider_test.go` (unit, no DB): all 5 scenarios return
+  the correct definitive/ambiguous shape; `Name()`; atomic
+  `InvocationCount()` under 20 concurrent goroutines.
+- `execution_engine_test.go` (integration, `TEST_DATABASE_URL`, 15
+  tests): ALLOW executes successfully end-to-end (field-by-field
+  verification: action status, type, provider, provider reference, case
+  status, exactly 1 provider invocation, persisted case status, exactly 1
+  `recovery_actions` row, `recovery_execution.started` +
+  `.completed` audit rows); definitive failure persists `FAILED` with an
+  error code and the case still reaches `VERIFYING`; fake-provider
+  timeout and fake-provider transport error both persist `UNKNOWN` and
+  never `SUCCESS`/`FAILED`, with a `recovery_execution.unknown` audit
+  row; `BLOCK` and `ESCALATE` decisions are rejected
+  (`ErrPolicyDecisionNotAllow`) with **zero** provider invocations and
+  zero `recovery_actions` rows; a case that never actually reached
+  `ALLOW` is rejected (`ErrRecoveryCaseNotAllow`) even when paired with a
+  structurally-valid `ALLOW` decision, zero provider invocations; missing
+  policy decision (`ErrPolicyDecisionNotFound`); a decision belonging to
+  a different case (`ErrPolicyDecisionCaseMismatch`); an `ALLOW` decision
+  with no `AuthorizedAction` (`ErrMissingAuthorizedAction`), a defensive
+  check since `PolicyEngine` itself should never produce this; a real
+  `ALLOW` decision for `send_payment_link` (genuinely produced by
+  `PolicyEngine`, not fabricated) is rejected with
+  `ErrActionNotExecutable` and zero provider invocations, since only
+  `retry_payment` is implemented; a duplicate execution request for the
+  same policy decision is fully idempotent (same action ID, exactly 1
+  provider invocation across both calls); **5-goroutine concurrent
+  execution** of the identical policy decision converges on exactly 1
+  provider invocation, exactly 1 `recovery_actions` row, exactly 1
+  `Created=true`, and a consistent final `VERIFYING` case status; a
+  dedicated no-secrets test scans both `recovery_actions.execution_metadata`
+  and `audit_events.metadata` after a real execution for a list of
+  forbidden substrings (`card_number`, `cvv`, `api_key`, `secret`,
+  `password`, `key_secret`, `authorization`) and finds none.
+
+**Verification performed:**
+- `gofmt -l .`, `go build ./...`, `go vet ./...` — clean.
+- `go test ./...` with no `TEST_DATABASE_URL` — all non-DB-gated tests
+  pass; DB-gated tests skip cleanly.
+- `TEST_DATABASE_URL=postgres://revguard:revguard@localhost:5432/revguard?sslmode=disable
+  go test ./... -v` — **every** test across `internal/domain`,
+  `internal/http`, `internal/repository`, `internal/service` passes,
+  including all 15 new `ExecutionEngine` tests, all 6 new `FakeProvider`
+  tests, and every Milestone 0–5 test with zero regressions.
+- `ai-service/`: confirmed zero git changes and all 36 Python tests still
+  pass — the AI service was not touched, per this milestone's scope.
+- Migration `000015` applied cleanly on native Postgres (Docker's
+  Postgres container remains non-functional in this sandbox — unchanged
+  limitation since Milestone 0, not a project defect; now at schema
+  version 15).
+- **Full cross-service manual smoke test**, real (non-Docker, non-mocked
+  at the process level) `ai-service` (`AI_PROVIDER=mock`, port 8128) +
+  Go backend (`PAYMENT_PROVIDER=fake`, port 8188) + native Postgres:
+  seeded a merchant/customer/payment/payment_attempt with a generic
+  `NETWORK_ERROR` failure code (chosen deliberately so the real mock AI
+  provider's rule-based logic — which recommends `send_payment_link` for
+  `insufficient_funds` and `request_payment_method_change` for
+  authentication codes — falls through to its `transient_failure` /
+  `retry_payment` default; this is genuine mock-provider behavior, not
+  tuned to force an outcome) via `psql`, then `POST /events` with a
+  `payment.failed` event returned `case_status: "ALLOW"` on the *first*
+  call — the entire
+  `DETECTED -> ANALYZING -> ANALYZED -> economic evaluation ->
+  POLICY_CHECK -> ALLOW` pipeline completing within one HTTP request, as
+  established in Milestone 5. `POST /v1/recovery-cases/{id}/execute`
+  (empty body) then returned `execution_status: "SUCCEEDED"`,
+  `case_status: "VERIFYING"`, `provider: "fake"`, a non-empty
+  `provider_reference`, `unknown: false`. Repeating the identical
+  `POST /execute` call returned the **same** `recovery_action_id` (real
+  idempotency against live HTTP-created state, not just isolated test
+  fixtures). `psql` confirmed: exactly 1 `recovery_actions` row
+  (`status=SUCCEEDED`, `action_type=RETRY_PAYMENT`, `provider=fake`, a
+  non-empty `provider_reference`, correct `idempotency_key`); case
+  `status=VERIFYING`; a full 7-event audit trail in order
+  (`recovery_case.created`/SYSTEM, `recovery_case.transitioned`/SYSTEM
+  for M2, `recovery_case.transitioned`/AI for M3,
+  `recovery_economics.evaluated`/SYSTEM for M4,
+  `recovery_policy.evaluated`/SYSTEM for M5,
+  `recovery_execution.started`/SYSTEM,
+  `recovery_execution.completed`/SYSTEM — the last two new this
+  milestone).
+- **Timeout -> UNKNOWN smoke test**: a second real case was driven
+  through the identical pipeline to a genuine `ALLOW` (same
+  `NETWORK_ERROR` fixture pattern), then executed via a temporary
+  `backend/cmd/execcheck` command (deleted immediately after use, same
+  pattern as the `idemcheck` tool used for Milestone 4/5 idempotency
+  verification) constructing `ExecutionEngine` with
+  `FakeProvider(FakeProviderScenarioTimeout)` against the exact
+  `recoveryCaseID`/`policyDecisionID` from that live HTTP-created case.
+  Result: `action.Status=UNKNOWN`, `case.Status=VERIFYING`. `psql`
+  confirmed the case's `status=VERIFYING` (never `SUCCESS` or `FAILED`),
+  the `recovery_actions` row has `status=UNKNOWN`,
+  `error_code=PROVIDER_RESPONSE_AMBIGUOUS`, and an empty
+  `provider_reference`, and the audit trail's final event is
+  `recovery_execution.unknown` (not `.completed`).
+- Both backend and ai-service processes were stopped cleanly after
+  verification; no server was left running.
+
+**Real Razorpay verification: NOT VERIFIED.** No `RAZORPAY_KEY_ID`/
+`RAZORPAY_KEY_SECRET` are configured in this sandbox, and this sandbox
+has no confirmed outbound network access to Razorpay's live API or
+current documentation. `RazorpayProvider` was written against Razorpay's
+long-stable, publicly documented Payment Links request/response shape
+but has **not** been exercised against a live endpoint, a Razorpay test
+account, or re-verified against current API docs in this session. It has
+no dedicated automated test (unlike `FakeProvider`, which is fully
+covered) because doing so without real network access would only test a
+hand-written mock of Razorpay's behavior, which would be misleading to
+present as verification. Do not claim Razorpay execution was tested
+until it has actually been run against a real Razorpay Test Mode
+account.
+
+**Known limitations:**
+- Only `retry_payment` has a real execution implementation. The other
+  five `RecommendedAction` values are structurally valid, can be
+  genuinely authorized by `PolicyEngine` (confirmed: `send_payment_link`
+  reaches `ALLOW` in practice, per Milestone 5's own verification), but
+  are rejected by `ExecutionEngine` with `ErrActionNotExecutable` rather
+  than executed — by design, not oversight; extending coverage is future
+  work, not a defect.
+- `RazorpayProvider`'s `retry_payment` maps to Payment Link creation, not
+  a literal payment re-charge — an interpretation necessitated by
+  Razorpay's actual API surface and RBI re-authentication rules, not an
+  approximation invented for convenience. See
+  `docs/architecture/execution-engine.md` for the full reasoning.
+- Execution is not automatically triggered when a case reaches `ALLOW` —
+  it requires an explicit `POST /execute` call. This is a deliberate
+  scope boundary (the milestone brief's execution-request boundary
+  section), not an oversight.
+- `executionStaleAfter` (30 seconds) is an illustrative threshold for
+  distinguishing "still in flight" from "abandoned," not derived from any
+  measured operational data.
+
+**Explicitly confirmed NOT implemented this milestone:** webhooks,
+webhook signature verification, reconciliation, payment outcome
+finalization as trusted/durable state, analytics/reporting, frontend/
+dashboard work, Redpanda consumer infrastructure, customer notification
+infrastructure (WhatsApp/SMS/email), human approval workflow, policy
+admin UI, Kubernetes, Temporal, a new database or message broker, a new
+major framework, broad Razorpay API surface beyond Payment Links,
+automatic retry loops after an ambiguous provider response. The
+`RecoveryCase` never transitions past `VERIFYING` in every test and in
+the manual verification above.
+
+**Next milestone: Milestone 7 — Webhooks, Reconciliation & Financial
+Truth.** Not yet scoped. Do not begin implementation until explicitly
+instructed. Milestone 7 will consume Razorpay webhooks (with signature
+verification), reconcile `VERIFYING`/`UNKNOWN` `RecoveryAction`s and
+`RecoveryCase`s against actual provider-reported outcomes, and be the
+first and only place that transitions a case to a trusted, durable
+`SUCCESS` or `FAILED`.
 
 ## Working conventions
 
@@ -1027,3 +1300,22 @@ webhooks until this milestone is explicitly started.
   see `evaluatePolicyRules`. Short-circuiting hides secondary reasons
   that matter for auditability ("why" should list everything that
   applied, not just whichever check happened to run first).
+- Under PostgreSQL READ COMMITTED, sequential `SELECT`s inside one
+  transaction do **not** share a single consistent snapshot — a
+  concurrent transaction can commit in the gap between two reads in the
+  same function. For an idempotency-check-then-state-check pattern (see
+  `PolicyEngine.Evaluate` and `ExecutionEngine.phase1`), re-check
+  idempotency once more immediately before treating a wrong-state
+  observation as a genuine error: if a concurrent call just finished,
+  its result is now visible precisely because it already committed, and
+  this is a safe retry, not an error. This was a real, reproducible bug
+  (found via a ~30%-flaky concurrency test) before the re-check was
+  added — don't skip it when writing the next such engine.
+- When an external call's outcome can be genuinely ambiguous (a
+  provider timeout, a transport error, or discovering an
+  abandoned/orphaned attempt from a crashed process), persist a
+  dedicated `UNKNOWN`-style status rather than guessing it into a
+  success or failure value, and never automatically retry it. Only a
+  later, dedicated reconciliation step (Milestone 7) may resolve
+  `UNKNOWN` — see `ExecutionEngine`'s provider-timeout handling and
+  `docs/architecture/execution-engine.md`.

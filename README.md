@@ -174,6 +174,19 @@ executed here. Read it back via
 [docs/architecture/policy-engine.md](./docs/architecture/policy-engine.md)
 for the full rule set.
 
+When a case is `ALLOW`, `POST /v1/recovery-cases/{id}/execute` (empty
+body — the client never supplies an action) triggers a bounded execution
+attempt: the backend reloads the case's authoritative `PolicyDecision`
+server-side, executes only its `AuthorizedAction` via a `PaymentProvider`
+abstraction (a deterministic fake provider by default, or a minimal,
+honestly-scoped Razorpay Payment Links adapter via
+`PAYMENT_PROVIDER=razorpay`), and moves the case
+`ALLOW -> EXECUTING -> VERIFYING`. An ambiguous provider result (timeout,
+transport error) is recorded as `UNKNOWN`, never guessed into
+`SUCCESS`/`FAILED`. See
+[docs/architecture/execution-engine.md](./docs/architecture/execution-engine.md)
+for the full idempotency, concurrency, and timeout-safety design.
+
 **Frontend (Next.js)**
 
 ```bash
