@@ -287,6 +287,60 @@ placeholder.
 for a case. Strictly read-only — no approve/override/execute capability
 exists at this or any endpoint.
 
+## Milestone 10: policy profiles
+
+A merchant's risk appetite varies. Milestone 10 added three named
+`PolicyConfig` values (`policy_config.go`) expressing that as an explicit
+choice rather than one hardcoded set of numbers — **the rules
+(`evaluatePolicyRules`) are byte-for-byte unchanged**; only the threshold
+*values* a profile supplies differ:
+
+| Threshold | Conservative | Balanced (= original default) | Aggressive |
+|---|---|---|---|
+| `Version` | `policy-v1-conservative` | `policy-v1` | `policy-v1-aggressive` |
+| `MinimumConfidence` | 0.75 | 0.60 | 0.50 |
+| `MaxAutoAmountMinorUnits` | 50,000 (₹500) | 100,000 (₹1,000) | 300,000 (₹3,000) |
+| `MinimumExpectedIncrementalValueMinorUnits` | 500 | 0 | 0 |
+| `MaxPaymentAttempts` | 2 | 3 | 4 |
+| `MaxPriorRecoveryActions` | 1 | 2 | 3 |
+| `AutoAllowedActions` extra | — | — | `request_payment_method_change: true` |
+
+These are RevGuard's own illustrative demonstration configurations —
+not claimed production Razorpay policy, not derived from historical loss
+data, exactly like the original default policy they extend.
+
+**Safety invariants that hold identically across every profile, because
+they live in code, not config:**
+
+- `stop_recovery` is unconditionally `BLOCK`ed by rule (B) regardless of
+  any profile's `AutoAllowedActions` map — no profile's config can
+  re-enable it, because the check isn't config-driven.
+- `MinimumExpectedIncrementalValueMinorUnits` is never negative in any
+  profile: "aggressive" means more tolerant thresholds elsewhere, never
+  authorization of a computed negative-expected-value action.
+- No profile lets confidence alone or expected value alone authorize —
+  both remain two independent checks among seven, exactly as in the
+  original design (see "Deterministic rules" above).
+
+`BalancedPolicyConfig` and the original `DefaultPolicyConfig` are two
+separate Go variables with identical values (not one aliasing the
+other), specifically so nothing about `cmd/server/main.go`'s existing
+wiring or any pre-Milestone-10 test has to change — see
+`TestBalancedPolicyConfig_MatchesDefaultPolicyConfig`.
+
+**Selecting a profile in production:** `POLICY_PROFILE` (env var,
+default `"balanced"`) is read in `cmd/server/main.go` and looked up in
+`service.PolicyProfiles`; an unrecognized value fails fast at startup
+rather than silently defaulting. This is the only new production
+(non-evaluation) capability Milestone 10 added — nothing about how
+`PolicyEngine.Evaluate` itself works changed; it still takes a
+`PolicyConfig` as a constructor parameter exactly as it always has.
+
+**Selecting a profile in the evaluation harness:** see
+`docs/architecture/evaluation-engine.md`'s Milestone 10 section —
+`RunEvaluation` now runs all three profiles against the identical
+synthetic dataset and reports the trade-off between them directly.
+
 ## What is explicitly out of scope (by design)
 
 Execution of any kind, Razorpay API calls, payment retries/links as real

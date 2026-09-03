@@ -1,9 +1,10 @@
-# Execution Engine — Milestone 6
+# Execution Engine — Milestone 6 (execution coverage extended in Milestone 10)
 
 This document describes how RevGuard turns an `ALLOW` `PolicyDecision`
-into a bounded, auditable execution attempt against a payment provider. It
-covers only what Milestone 6 implements: executing `retry_payment` via a
-provider abstraction, and recording the result honestly — including when
+into a bounded, auditable execution attempt against a payment provider.
+Milestone 6 implemented `retry_payment`; Milestone 10 added
+`send_payment_link` through the identical mechanism (see "Milestone 10:
+send_payment_link" below) — both are recorded honestly, including when
 the result is genuinely unknown. Financial truth (webhook verification,
 reconciliation, `SUCCESS`/`FAILED` as a durable, trusted state) is
 Milestone 7 and is not established here.
@@ -350,6 +351,67 @@ There is no "force execute" endpoint, no manual override, and no way for
 a request body to name an action — the entire authorization surface is
 the server-side policy-decision lookup plus `ExecutionEngine`'s own
 validation chain.
+
+## Milestone 10: `send_payment_link`
+
+`send_payment_link` is the second `domain.RecommendedAction` to get a
+real execution implementation, added without changing any of the
+transaction-boundary, idempotency, or auditability guarantees described
+above.
+
+**What changed, precisely:**
+
+- `executableActions` (`execution_engine.go`) replaced the old hardcoded
+  `if decision.AuthorizedAction != domain.RecommendedActionRetryPayment`
+  check with a map:
+  `{retry_payment: RETRY_PAYMENT, send_payment_link: SEND_PAYMENT_LINK}`.
+  Extending real execution coverage to a future action is "add an entry
+  here, add a case in `Execute`'s provider dispatch, add the matching
+  `PaymentProvider` method" — no other engine logic changes.
+- `PaymentProvider` gained one new method,
+  `SendPaymentLink(ctx, SendPaymentLinkRequest) (SendPaymentLinkResult, error)`,
+  with the identical error-vs-result split as `RetryPayment` (a non-nil
+  error is always ambiguous, never a definitive failure).
+  `FakeProvider.SendPaymentLink` applies the same five deterministic
+  scenarios as `RetryPayment`. `RazorpayProvider.SendPaymentLink` calls
+  the exact same Payment Links operation as `RetryPayment` — Razorpay's
+  API offers no different mechanism for "proactively send a link" versus
+  "retry via a link" — via a shared private `createPaymentLink` helper,
+  so the HTTP/error-classification logic is never duplicated.
+- `Execute`'s Phase 2 now dispatches on `p1.action.ActionType` to call
+  either `RetryPayment` or `SendPaymentLink`, then normalizes either
+  provider method's result into the same shape before handing it to
+  Phase 3 — **Phase 3 itself was not touched.**
+
+**Why this preserves "payment-link creation is not financial success"
+automatically, not as a new safety check:** Phase 3 already, since
+Milestone 6, transitions `RecoveryCase.Status` unconditionally to
+`VERIFYING` (never directly to `SUCCESS`) regardless of the provider's
+`Succeeded` value — that was always true for `retry_payment`'s own
+"create a Payment Link" implementation (see "Why 'retry' means here" in
+the `RazorpayProvider` section above). Wiring `send_payment_link` through
+the identical Phase 1/Phase 3 code path means this invariant holds for
+it automatically, with zero new logic: a `RecoveryAction` can reach
+`SUCCEEDED` (the link was created), while `RecoveryCase` only ever
+reaches `VERIFYING`, waiting for Milestone 7's webhook/reconciliation to
+establish whether the customer actually paid.
+
+**Tests** (`execution_engine_test.go`,
+`TestExecutionEngine_SendPaymentLink_*`): mirror every `retry_payment`
+test field-for-field — successful execution (including the explicit
+assertion that case status is `VERIFYING`, never `SUCCESS`), definitive
+failure, timeout, transport error, idempotency, and 5-goroutine
+concurrency — proving `send_payment_link` goes through the identical
+pipeline, never a parallel or weaker one.
+`seedAllowDecisionForUnsupportedAction` now uses `send_reminder` (still
+genuinely unsupported) in place of the old
+`seedAllowDecisionForSendPaymentLink`-based rejection test, since
+`send_payment_link` is no longer rejected.
+
+**Razorpay verification status is unchanged: NOT VERIFIED.**
+`RazorpayProvider.SendPaymentLink` reuses the same unverified HTTP call
+as `RetryPayment` — see the verification-status paragraph above, which
+applies identically here.
 
 ## What is explicitly out of scope (by design)
 

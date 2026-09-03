@@ -73,11 +73,14 @@ deployments/         deployment configuration (future use)
 docs/architecture/   architecture notes/diagrams (event-flow.md: Milestone 2 pipeline;
                      ai-diagnosis.md: Milestone 3 AI diagnosis pipeline;
                      economic-engine.md: Milestone 4 economic evaluation pipeline;
-                     policy-engine.md: Milestone 5 policy decision pipeline;
-                     execution-engine.md: Milestone 6 execution pipeline;
+                     policy-engine.md: Milestone 5 policy decision pipeline,
+                     policy profiles added in Milestone 10;
+                     execution-engine.md: Milestone 6 execution pipeline,
+                     send_payment_link execution added in Milestone 10;
                      webhooks-reconciliation.md: Milestone 7 webhook/reconciliation/
                      financial-truth pipeline; evaluation-engine.md: Milestone 8
-                     SYNTHETIC evaluation/revenue-recovery-proof harness)
+                     SYNTHETIC evaluation/revenue-recovery-proof harness,
+                     multi-profile comparison added in Milestone 10)
 docs/decisions/      ADRs (0001: recovery probability vs. AI confidence, and why the
                      Economic Engine doesn't decide; 0002: why AI recommendation,
                      economic evaluation, and policy authorization are three
@@ -1972,7 +1975,330 @@ dashboard surface for evaluation results, once there is real interest in
 making this data visible in the frontend. Do not begin implementation
 until explicitly instructed.
 
-**Next milestone: Milestone 10.** Not yet scoped. Do not begin
+### Milestone 10 — Recovery Optimization & Production Readiness: COMPLETE
+
+Goal: use Milestone 9's own evaluation findings to make two genuine
+product improvements — real `send_payment_link` execution and
+merchant-selectable policy risk profiles — without weakening any safety
+control, then re-run the exact same evaluation methodology to measure
+the honest trade-off. **Every evaluation number in this section remains
+SYNTHETIC**, exactly as in Milestones 8–9; nothing here is, or claims to
+be, live Razorpay production data.
+
+**Note on the incoming brief's milestone labels:** the M10 instructions
+described "M8 → dashboard" and "M9 → reproducible synthetic evaluation."
+Per this repository's actual history (this document), M8 is the
+evaluation/revenue-recovery-proof harness and M9 is its execution-
+fidelity refinement — no dashboard existed before this milestone. This
+section follows the repository's real history, not the brief's
+mislabeling, per the brief's own instruction to inspect the repository
+first and not let the prompt override it.
+
+- [x] **Phase 1 — repository inspection.** Read CLAUDE.md's M5–M9
+      sections, `execution_engine.go`, `policy_engine.go`/`policy_config.go`,
+      `webhook_processor.go`/`reconciliation_engine.go`, migrations
+      (confirmed `recovery_actions.action_type`'s `CHECK` constraint
+      already allowed `SEND_PAYMENT_LINK` since migration `000006` —
+      **no new migration was needed**), the existing `PaymentProvider`
+      abstraction, `execution_engine_test.go`'s existing
+      `seedAllowDecisionForSendPaymentLink` fixture, and confirmed via
+      `find`/`git grep` that the frontend was still the Milestone 0
+      skeleton with zero evaluation/dashboard hooks.
+- [x] **Phase 2 — `send_payment_link` execution**
+      (`backend/internal/service/{payment_provider,fake_payment_provider,
+      razorpay_provider,execution_engine}.go`): `PaymentProvider` gained
+      `SendPaymentLink(ctx, SendPaymentLinkRequest) (SendPaymentLinkResult, error)`
+      with the identical error-vs-result (ambiguous-vs-definitive) split
+      as `RetryPayment`. `FakeProvider.SendPaymentLink` applies the same
+      five deterministic scenarios. `RazorpayProvider.SendPaymentLink`
+      calls the identical Payment Links operation as `RetryPayment`
+      through a new shared private `createPaymentLink` helper (no HTTP
+      logic duplicated). `ExecutionEngine`'s hardcoded
+      `AuthorizedAction != retry_payment` check became a lookup into a
+      new `executableActions` map (`{retry_payment: RETRY_PAYMENT,
+      send_payment_link: SEND_PAYMENT_LINK}`); `Execute`'s Phase 2
+      dispatches to the matching provider method by
+      `action.ActionType`, then normalizes the result before handing it
+      to **Phase 3, which was not touched at all**. Because Phase 3
+      already (since Milestone 6) transitions `RecoveryCase.Status`
+      unconditionally to `VERIFYING` — never directly to `SUCCESS` —
+      regardless of the provider's `Succeeded` value, "payment-link
+      creation is not financial success" holds for `send_payment_link`
+      automatically, with zero new safety logic required. Financial
+      `SUCCESS` still requires Milestone 7's webhook/reconciliation, via
+      the unmodified `applyFinancialOutcome`.
+- [x] **Provider safety confirmed**: `FakeProvider` distinguishes "link
+      created" (`Succeeded=true`) from "payment succeeded" exactly as it
+      already did for `retry_payment` — a `SUCCEEDED` `RecoveryAction`
+      status is never conflated with a `SUCCESS` `RecoveryOutcome`
+      anywhere in the code. `RazorpayProvider.SendPaymentLink` reuses
+      the same **NOT VERIFIED against a real Razorpay account** status
+      as `RetryPayment` — see below.
+- [x] **Phase 3 — policy profiles** (`backend/internal/service/policy_config.go`):
+      `ConservativePolicyConfig`, `BalancedPolicyConfig` (numerically
+      identical to the pre-existing `DefaultPolicyConfig` — kept as a
+      separate variable, not an alias, so no M0–M9 wiring or test had to
+      change), and `AggressivePolicyConfig`, registered in
+      `PolicyProfiles map[string]PolicyConfig`. Exact values and
+      rationale are documented in
+      [`docs/architecture/policy-engine.md`](./docs/architecture/policy-engine.md#milestone-10-policy-profiles).
+      `evaluatePolicyRules` itself (Milestone 5) is **byte-for-byte
+      unchanged** — only threshold values differ between profiles.
+      `stop_recovery` is unconditionally `BLOCK`ed by rule (B)
+      regardless of any profile's `AutoAllowedActions` map (enforced in
+      code, not config, so no profile can weaken it), and
+      `MinimumExpectedIncrementalValueMinorUnits` is never negative in
+      any profile — "aggressive" means more tolerant thresholds, never
+      a weakened safety rule. `POLICY_PROFILE` (env var, default
+      `"balanced"`) is wired into `cmd/server/main.go`, looked up in
+      `service.PolicyProfiles`, failing fast on an unrecognized value.
+- [x] **Phase 4/5 — multi-profile evaluation with execution fidelity**
+      (`backend/internal/service/evaluation_{strategies,engine}.go`):
+      `RevGuardStrategy` gained a `policyConfig` field and
+      `NewRevGuardStrategyWithProfile(name, config)`.
+      `isRevGuardActionExecutable` now consults the exact same
+      `executableActions` map `ExecutionEngine` uses (not a separate,
+      evaluation-only list), so `send_payment_link` is now credited with
+      real cost/possible recovery in the simulation, matching its new
+      production capability. `RunEvaluation` runs five strategies
+      (`fixed_retry`, `static_rules`, `revguard_conservative`,
+      `revguard_balanced`, `revguard_aggressive`) against the **same
+      dataset** for a given `(seed, cases)` and produces a 3×2
+      comparison matrix (every profile against every baseline).
+      **The synthetic dataset generator and ground-truth model were not
+      modified this milestone** — confirmed via
+      `git diff --stat` against the Milestone 9 baseline showing
+      `evaluation_dataset.go`/`evaluation_ground_truth.go` untouched.
+- [x] **Phase 6 — economic engine inspected, not rewritten.**
+      `HeuristicProbabilityEstimator`, `GetActionEconomics`, and the
+      economic formulas (`economic_calculations.go`) were read in full
+      and found to have no structural defect warranting a change — the
+      calibration gap Milestone 9 observed
+      (`ExpectedRecoveryValueMinorUnits` exceeding
+      `RevenueRecoveredMinorUnits`) is fully explained by (a) the
+      deliberately-independent ground-truth model and (b) the
+      execution-capability/ambiguous-outcome gaps Milestone 9 itself
+      already introduced metrics for. No probability, cost, or risk
+      value in `economic_calculations.go`, `action_economics.go`, or
+      `recovery_probability_estimator.go` was changed. AI confidence is
+      still never treated as recovery probability, and expected
+      (predicted) recovery is still never conflated with actual
+      (realized) recovery anywhere in the codebase.
+- [x] **Phase 9 — dashboard.** No dashboard existed (confirmed above).
+      Added the minimum read-only presentation: `GET /v1/evaluation`
+      (`backend/internal/http/evaluation.go`, wired in `router.go`) —
+      calls `service.RunEvaluation` directly, opens no database
+      connection, has no side effects, bounds `?cases=` at 5,000 to
+      prevent an unbounded computation from an unauthenticated query
+      parameter — and one new page,
+      `frontend/app/evaluation/page.tsx`, a client component that
+      fetches that endpoint via `NEXT_PUBLIC_API_URL` (the env var
+      already defined in `.env.example`) and renders two plain HTML
+      tables (strategy comparison; profile-vs-baseline). No chart
+      library or other dependency was added; no number is hardcoded in
+      the component; the homepage (`app/page.tsx`) was not touched.
+- [x] Explicitly NOT implemented (by design, per milestone scope): ML
+      training, new databases, Redpanda/Kafka redesign, Kubernetes,
+      Temporal, new microservices, automatic background retry workers,
+      customer messaging integrations, live payment experimentation,
+      frontend redesign beyond the one new page, policy bypass of any
+      kind, fabricated benchmark improvements, any M11 work.
+
+**Test counts:** 5 new tests in `internal/http` (`evaluation_test.go`:
+defaults, custom seed/cases, invalid seed, cases-above-max, negative
+cases), plus new/updated tests in `internal/service` across
+`execution_engine_test.go` (6 new `SendPaymentLink_*` tests mirroring
+every `retry_payment` test, plus the `UnsupportedActionNoProviderCall`
+fixture switched to `send_reminder`), `fake_payment_provider_test.go`
+(5 new `SendPaymentLink_*` scenario tests), `policy_profiles_test.go`
+(new file, 9 tests: registry completeness, `Balanced == Default`,
+per-profile threshold validity, `stop_recovery` always `BLOCK`ed,
+negative expected value always `BLOCK`ed, confidence-alone/expected-
+value-alone never authorize, genuinely different outcomes across
+profiles on identical input, determinism), and `evaluation_strategies_test.go`/
+`evaluation_engine_test.go` (send_payment_link-is-now-executed test,
+updated unsupported-action test, updated multi-profile
+`RunEvaluation` tests, two new reproducibility/differentiation tests).
+Combined with the unchanged Milestone 0–9 suite, the full `go test ./...`
+(with `TEST_DATABASE_URL` set) run is **242 tests pass, 0 fail**.
+
+**Actual evaluation results (synthetic, seed 12345, 1000 opportunities —
+recorded here verbatim from a real run):**
+
+```
+Revenue At Risk:               251,664,828 minor units (INR)
+Potentially Recoverable:        79,624,948 minor units (INR)
+
+Strategy                Recovered  Actions  Blocked  Escalated  Unsupported  Ambiguous  NetValue    Unnecessary  Rate%   AvgAttempts
+fixed_retry              47,563,828    506      494        0            0        15    46,672,362      315     18.90%   1.50
+static_rules               1,746,191     38      962        0            0         2     1,716,886       22      0.69%   1.00
+revguard_conservative               0      1      827      172            0         1          -314        0      0.00%   1.00
+revguard_balanced             449,575     34      648      318            0         3       426,311       24      0.18%   1.32
+revguard_aggressive         6,931,542    128      528      252           92         6     6,809,303       77      2.75%   1.68
+
+Comparison (each RevGuard profile vs. each baseline, same dataset):
+revguard_conservative vs fixed_retry:   incremental_recovered_revenue=-47,563,828  incremental_net_value=-46,672,676  action_reduction=99.80%   incremental_recovery_rate=-0.1890
+revguard_conservative vs static_rules:  incremental_recovered_revenue= -1,746,191  incremental_net_value= -1,717,200  action_reduction=97.37%   incremental_recovery_rate=-0.0069
+revguard_balanced      vs fixed_retry:  incremental_recovered_revenue=-47,114,253  incremental_net_value=-46,246,051  action_reduction=93.28%   incremental_recovery_rate=-0.1872
+revguard_balanced      vs static_rules: incremental_recovered_revenue= -1,296,616  incremental_net_value= -1,290,575  action_reduction=10.53%   incremental_recovery_rate=-0.0052
+revguard_aggressive    vs fixed_retry:  incremental_recovered_revenue=-40,632,286  incremental_net_value=-39,863,059  action_reduction=74.70%   incremental_recovery_rate=-0.1615
+revguard_aggressive    vs static_rules: incremental_recovered_revenue=  5,185,351  incremental_net_value=  5,092,417  action_reduction=-236.84% incremental_recovery_rate= 0.0206
+```
+
+**Honest interpretation — the actual trade-off exposed, not a
+"RevGuard wins" narrative:**
+- **Conservative recovers essentially nothing (0)** in this dataset: its
+  ₹500 auto-approval ceiling and required positive expected-value buffer
+  escalate or block nearly everything (827 blocked + 172 escalated out
+  of 1000). This is what "minimize unnecessary actions" looks like taken
+  to its logical extreme against a dataset whose amounts mostly exceed
+  ₹500 — it is not a bug, it is the conservative profile doing exactly
+  what it's configured to do.
+- **Aggressive dominates the other two RevGuard profiles by a wide
+  margin** (6.93M recovered vs. 450K balanced vs. 0 conservative) and is
+  the **only RevGuard profile that beats a baseline outright**: it
+  recovers 5,185,351 more than `static_rules` with a positive
+  `incremental_recovery_rate` (+0.0206), while still taking 74.70% fewer
+  actions than `fixed_retry`. It still recovers less than `fixed_retry`
+  in raw terms (-40.6M) — `fixed_retry` blindly retries almost
+  everything, including many opportunities aggressive correctly
+  escalates or that turn out ambiguous/unsupported.
+- **None of the three profiles beats `fixed_retry` on raw recovered
+  revenue** in this specific illustrative dataset (INR 50–5,000 amount
+  range against illustrative auto-approval ceilings of ₹500/₹1,000/₹3,000).
+  This is the same root cause Milestone 8/9 already identified and is
+  reported here unchanged, per the explicit instruction not to force a
+  "RevGuard wins" conclusion: a merchant with a real payment-amount
+  distribution skewed lower (or a profile with a higher ceiling than
+  even "aggressive" here) would likely see a different outcome — that is
+  exactly the kind of trade-off exploration these profiles now make
+  possible, and exactly what future tuning should be informed by real
+  data for, not this synthetic run.
+- `revguard_aggressive` is also the only profile with a nonzero
+  `UnsupportedActions` count (92) — it auto-allows
+  `request_payment_method_change`, which has no execution
+  implementation, so those opportunities are correctly recorded as
+  authorized-but-not-executed rather than silently credited.
+
+**Repeatability verification:** ran
+`go run ./cmd/evaluate --seed 12345 --cases 1000 --output evaluation.json`
+twice with different `--commit` values and `diff`'d the two JSON files —
+byte-for-byte identical.
+`TestRunEvaluation_ProfilesReproducibleOnSameDatasetAndSeed` verifies
+this per-profile (not just for the whole result) in the automated suite.
+
+**Verification performed:**
+- `gofmt -l .` — clean.
+- `go build ./...`, `go vet ./...` — clean.
+- `go test ./...` with no `TEST_DATABASE_URL` — all non-DB-gated tests
+  pass.
+- `TEST_DATABASE_URL=postgres://revguard:revguard@localhost:5432/revguard?sslmode=disable
+  go test ./... -v`: **242 tests pass, 0 fail**, across `internal/domain`,
+  `internal/http`, `internal/repository`, `internal/service`.
+- `TEST_DATABASE_URL=... go test ./... -race` — clean, no data races.
+- `ai-service/`: zero changes — Milestone 10 is Go/TypeScript-only.
+- Migrations: none added — `recovery_actions.action_type`'s existing
+  `CHECK` constraint (migration `000006`) already allowed
+  `SEND_PAYMENT_LINK` since Milestone 1.
+- Manual end-to-end smoke test: started the real Go backend
+  (`PAYMENT_PROVIDER=fake`, native Postgres) and confirmed
+  `GET /health` and `GET /v1/evaluation?seed=1&cases=20` both return
+  real, correctly-shaped JSON. Started the Next.js dev server with
+  `NEXT_PUBLIC_API_URL` pointed at that backend and confirmed
+  `GET /evaluation` returns `200` with the expected static shell
+  (`RevGuard Evaluation` header, `Synthetic evaluation` badge, `Loading…`
+  placeholder) server-rendered before client-side hydration; `npm run
+  build` and `npx tsc --noEmit` both pass. **Limitation honestly noted:**
+  this sandbox has no headless browser available, so the client-side
+  fetch-and-render of live data was not visually confirmed in an actual
+  browser — it was verified indirectly by (a) confirming the exact JSON
+  shape the component expects via a direct `curl` against the running
+  backend, matching the TypeScript types field-for-field, and (b) `npx
+  tsc --noEmit` type-checking the component against those exact types.
+  Both temporary server processes were killed after verification; no
+  server was left running.
+- Read-only production readiness audit (Phase 10), verified by direct
+  code inspection, not assumption: AI cannot execute actions or bypass
+  policy (unchanged since M3/M5; `deterministicDiagnosis` in the
+  evaluation harness is a labeled stand-in, never live AI, and never
+  executes anything real either); a client cannot choose an arbitrary
+  action (`POST /execute` and the new `GET /v1/evaluation` both take no
+  action-selecting parameter; `ExecutionEngine` always reloads
+  `AuthorizedAction` fresh from PostgreSQL); `BLOCK`/`ESCALATE` cannot
+  execute (`ErrPolicyDecisionNotAllow`, tested); execution requires a
+  persisted `ALLOW` (`phase1` loads the decision by ID, never trusts a
+  caller-supplied action); provider calls happen outside DB transactions
+  (Phase 2 unchanged, confirmed for both `RetryPayment` and the new
+  `SendPaymentLink` dispatch); ambiguous outcomes are never treated as
+  success (`providerErr != nil` branch in `phase3` unchanged;
+  `resolveFinancialOutcome` in the evaluation harness checks
+  `ObservationAmbiguous` before `Recoverable`); webhooks/reconciliation
+  remain the sole authority for financial truth (`webhook_processor.go`/
+  `reconciliation_engine.go` have zero diff this milestone); money stays
+  integer minor units everywhere new (`SendPaymentLinkRequest/Result`,
+  every `PolicyConfig` profile); idempotency is intact
+  (`send_payment_link` reuses the identical
+  `"policy-decision:<policyDecisionID>"` key and `TryCreate`/
+  `resumeExisting` logic, verified by dedicated duplicate/concurrency
+  tests); the audit trail is intact (`phase1`/`phase3` audit code is
+  untouched and already action-type-generic); no secret is logged
+  (`RazorpayProvider`'s new `createPaymentLink` helper reuses the exact
+  same `SetBasicAuth`-only credential path as before,
+  `TestExecutionEngine_NoSecretsInPersistedMetadata` still passes); no
+  real Razorpay financial action was executed (no
+  `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` configured, `RazorpayProvider`
+  was never invoked outside of code review — only `FakeProvider` ran in
+  every test and smoke test); no Milestone 11 work was started.
+
+**Dashboard integration status:** minimal, read-only, real-data-backed —
+see Phase 9 above. Not a redesign; the existing homepage is untouched.
+
+**Known limitations:** all Milestone 8/9 limitations still apply (see
+`docs/architecture/evaluation-engine.md`'s "Known limitations"). New
+this milestone: `RazorpayProvider.SendPaymentLink` is **NOT VERIFIED**
+against a real Razorpay account, for the identical reason
+`RazorpayProvider.RetryPayment` never was (no credentials, no verified
+network access to Razorpay's API/docs in this sandbox) — it reuses the
+same unverified HTTP call path; the three policy profiles' exact
+threshold values are illustrative choices for this demonstration, not
+derived from any merchant's real payment-amount distribution or
+historical loss data (the honest interpretation above explains exactly
+how that shows up in the aggressive-vs-fixed_retry result); the
+frontend's live data-fetch was not visually confirmed in a real browser
+(see "Verification performed" above for exactly what was and wasn't
+checked).
+
+**Confirmations:**
+- Results are SYNTHETIC. No real Razorpay, merchant, or customer data
+  was used anywhere in this milestone.
+- No claim is made that RevGuard has been validated against live
+  Razorpay production data, or that `send_payment_link` execution has
+  been verified against a real Razorpay account.
+- No real Razorpay financial action was executed — `RazorpayProvider`
+  was never invoked against a live endpoint at any point this milestone.
+- Milestone 11 was NOT started — no file outside the scope described
+  above was created or modified.
+- No `git init`/`git add`/`git commit`/`git push`/branch-creation was
+  performed by this work; the user manages git manually in this
+  project, as in every prior milestone. (A commit titled "working on
+  dashboard," made by the user directly mid-session, appears in this
+  session's `git log` — not created by this work.)
+
+**Recommended next milestone:** Milestone 11 — not yet scoped. Natural
+candidates surfaced by this milestone's honest results (observations,
+not commitments): (a) calibrating policy-profile thresholds (especially
+the auto-approval ceiling) against a real or more representative
+payment-amount distribution, since this synthetic dataset's shape is
+what makes even the aggressive profile lose to `fixed_retry` on raw
+recovered revenue; (b) extending `ExecutionEngine` to a third action
+(e.g. `send_reminder`, the cheapest and simplest remaining one) now that
+the `executableActions` pattern makes this a small, well-contained
+change; (c) if real interest emerges in showing this data more broadly,
+a slightly richer (still read-only) dashboard view — e.g. a per-profile
+detail page — built on the same `GET /v1/evaluation` endpoint. Do not
+begin implementation until explicitly instructed.
+
+**Next milestone: Milestone 11.** Not yet scoped. Do not begin
 implementation until explicitly instructed.
 
 ## Working conventions

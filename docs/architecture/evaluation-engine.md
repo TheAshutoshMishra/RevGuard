@@ -1,4 +1,4 @@
-# Evaluation & Revenue Recovery Proof — Milestones 8–9
+# Evaluation & Revenue Recovery Proof — Milestones 8–10
 
 This document describes RevGuard's offline, deterministic evaluation
 harness: the system that answers, with a computed number rather than a
@@ -91,6 +91,65 @@ isn't actually executable or when its outcome never resolves), Milestone
 this is the direct, intended effect of aligning the simulation with
 production reality more closely, not a regression. See CLAUDE.md's
 Milestone 9 section for the exact before/after figures.
+
+## Milestone 10: policy profiles and send_payment_link
+
+Milestone 10 used Milestone 9's own findings to change two things about
+the real product (not the evaluation methodology), then re-ran the exact
+same evaluation to measure the effect:
+
+1. **`send_payment_link` became genuinely executable** (see
+   `docs/architecture/execution-engine.md`'s Milestone 10 section) — the
+   real `ExecutionEngine.phase1` now recognizes it via the shared
+   `executableActions` map, and `isRevGuardActionExecutable`
+   (`evaluation_strategies.go`) was updated to consult that exact same
+   map rather than a separate, evaluation-only list — so the simulation
+   can never silently drift from what production actually supports.
+2. **Three named `PolicyConfig` profiles** (conservative/balanced/
+   aggressive — see `docs/architecture/policy-engine.md`) replaced the
+   single hardcoded `DefaultPolicyConfig` `RevGuardStrategy` always used.
+   `RevGuardStrategy` gained a `policyConfig` field and
+   `NewRevGuardStrategyWithProfile(name, config)`; `RunEvaluation` now
+   builds three RevGuard strategies (`revguard_conservative`,
+   `revguard_balanced`, `revguard_aggressive`) instead of one, each
+   using the identical `evaluatePolicyRules` function with different
+   threshold values.
+
+**What did NOT change:** the synthetic dataset generator, the
+ground-truth model, the two baselines, and the AI-diagnosis stand-in are
+byte-for-byte identical to Milestone 9 — per this milestone's explicit
+"do not optimize the synthetic ground truth for RevGuard, do not change
+the dataset merely because RevGuard performs poorly" instruction, `git
+diff` confirms `evaluation_dataset.go` and `evaluation_ground_truth.go`
+were not touched this milestone. All five strategies (two baselines,
+three profiles) run against the exact one dataset generated for a given
+`(seed, cases)` — the same loop in `RunEvaluation` that always existed,
+now iterating five strategies instead of three.
+
+**Comparisons became a 3×2 matrix.** `ComparisonResult` gained a
+`ProfileName` field; `RunEvaluation` now produces six comparisons
+(`revguard_conservative_vs_fixed_retry`,
+`revguard_conservative_vs_static_rules`,
+`revguard_balanced_vs_fixed_retry`, ... `revguard_aggressive_vs_static_rules`)
+instead of two. Every formula in "Metrics and exact formulas" below is
+unchanged — only the number of times it's computed (once per
+profile-baseline pair) changed.
+
+**Dashboard integration (Milestone 10):** the frontend was still at its
+Milestone 0 skeleton state with no evaluation-presentation hooks of any
+kind (confirmed via `git grep` before adding anything). Per this
+milestone's instruction to add only the minimum required read-only
+presentation, two things were added and nothing else: a read-only
+`GET /v1/evaluation?seed=&cases=` HTTP endpoint
+(`backend/internal/http/evaluation.go`) that calls `service.RunEvaluation`
+directly and returns its JSON unmodified (no DB connection opened, no
+side effects — verified by reading the file's imports), and one new
+Next.js page (`frontend/app/evaluation/page.tsx`) that fetches that
+endpoint client-side and renders two plain tables (strategy comparison,
+profile-vs-baseline). No chart library or other new dependency was
+added; no number is hardcoded in the React component — every value comes
+from the fetched JSON. The page repeats the "Synthetic evaluation — not
+production performance" label from the API response.
 
 ## Architecture
 
@@ -303,12 +362,12 @@ established.
 | Potentially Recoverable Revenue | `sum(opportunity.AmountMinorUnits)` where `groundTruth.Recoverable == true` |
 | Revenue Recovered | `sum(opportunity.AmountMinorUnits)` where `decision.Executed == true AND resolveFinancialOutcome(truth) == SUCCESS` |
 | Recovery Rate | `RevenueRecovered / RevenueAtRisk` (0 if RevenueAtRisk is 0) |
-| Incremental Recovered Revenue | `revguard.RevenueRecovered - baseline.RevenueRecovered` |
+| Incremental Recovered Revenue | `profile.RevenueRecovered - baseline.RevenueRecovered` (computed once per RevGuard profile × baseline pair) |
 | Recovery Cost | `sum(decision.ActionCostMinorUnits)` (0 unless Executed) |
 | Risk Cost | `sum(decision.RiskCostMinorUnits)` (0 unless Executed) |
 | Expected Recovery Value | `sum(decision.ExpectedGrossRecoveryMinorUnits)` over every `Outcome == ALLOW` (executed or not); always 0 for the baselines, which have no economic model |
 | Net Incremental Value | `RevenueRecovered - RecoveryCost - RiskCost` |
-| Incremental Net Value | `revguard.NetIncrementalValue - baseline.NetIncrementalValue` |
+| Incremental Net Value | `profile.NetIncrementalValue - baseline.NetIncrementalValue` |
 | Actions Taken | count of `Executed == true` |
 | Actions Blocked | count of `Outcome == BLOCK` |
 | Human Escalations | count of `Outcome == ESCALATE` |
@@ -316,8 +375,8 @@ established.
 | Ambiguous Outcomes | count of `Executed == true AND resolveFinancialOutcome(truth) == UNKNOWN` |
 | Unnecessary Actions | count of `Executed == true AND resolveFinancialOutcome(truth) == FAILED` |
 | Average Attempts | mean of `opportunity.PreviousAttempts` over opportunities where `Executed == true` (0 if none) |
-| Action Reduction % | `(baseline.ActionsTaken - revguard.ActionsTaken) / baseline.ActionsTaken * 100` (0 if baseline took no actions) |
-| Incremental Recovery Rate | `revguard.RecoveryRate - baseline.RecoveryRate` |
+| Action Reduction % | `(baseline.ActionsTaken - profile.ActionsTaken) / baseline.ActionsTaken * 100` (0 if baseline took no actions) |
+| Incremental Recovery Rate | `profile.RecoveryRate - baseline.RecoveryRate` |
 
 Every opportunity falls into exactly one of Actions Blocked / Human
 Escalations / Unsupported Actions / (executed: SUCCESS, contributing to
