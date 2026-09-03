@@ -252,24 +252,19 @@ func TestExecutionEngine_EscalateCannotExecute(t *testing.T) {
 func TestExecutionEngine_AnalyzedCaseCannotExecute(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	payment := seedPayment(t, pool)
+	// seedFullCase creates the case in ANALYZED along with a real
+	// diagnosis/evaluation pair (needed to satisfy policy_decisions' FKs)
+	// but we never run PolicyEngine, so the case is genuinely never ALLOW.
+	recoveryCase, diagnosis, evaluation := seedFullCase(t, pool,
+		domain.FailureCategoryTransientFailure, domain.RecommendedActionRetryPayment, 0.90, 10_000, 5_000)
 	now := time.Now().UTC()
-
-	recoveryCase := &domain.RecoveryCase{
-		ID: uuid.New(), MerchantID: payment.MerchantID, CustomerID: payment.CustomerID,
-		PaymentID: payment.ID, Status: domain.RecoveryCaseStatusAnalyzed,
-		RevenueAtRisk: payment.Amount, CreatedAt: now, UpdatedAt: now,
-	}
-	if err := repository.NewPostgresRecoveryCaseRepository(pool).Create(ctx, recoveryCase); err != nil {
-		t.Fatalf("create recovery case: %v", err)
-	}
 
 	// A structurally-valid ALLOW decision that references this case, even
 	// though the case itself never actually reached ALLOW (simulating,
 	// e.g., a stale/replayed decision ID against a case that moved on).
 	decision := &domain.PolicyDecision{
 		ID: uuid.New(), RecoveryCaseID: recoveryCase.ID,
-		RecoveryDiagnosisID: uuid.New(), RecoveryEconomicEvaluationID: uuid.New(),
+		RecoveryDiagnosisID: diagnosis.ID, RecoveryEconomicEvaluationID: evaluation.ID,
 		Outcome: domain.PolicyDecisionOutcomeAllow, AuthorizedAction: domain.RecommendedActionRetryPayment,
 		PolicyVersion: service.PolicyVersion, ReasonCodes: []domain.PolicyReasonCode{domain.PolicyReasonPolicyAllowed},
 		Explanation: "test", EvaluatedAt: now, CreatedAt: now,
