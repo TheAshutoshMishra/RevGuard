@@ -152,6 +152,17 @@ set `AI_PROVIDER=anthropic` and `ANTHROPIC_API_KEY` for real model calls.
 See [docs/architecture/ai-diagnosis.md](./docs/architecture/ai-diagnosis.md)
 for the full contract.
 
+Once a case reaches `ANALYZED`, the backend deterministically evaluates
+whether the recommendation has positive expected economic value —
+revenue at risk, estimated recovery probability, expected gross recovery,
+action cost, risk cost, and expected incremental value — and stores the
+result. This never changes the case's status or decides anything; it's
+pure evaluation. Read it back via
+`GET /v1/recovery-cases/{id}/economic-evaluation`. See
+[docs/architecture/economic-engine.md](./docs/architecture/economic-engine.md)
+for the full model, including why AI confidence is not recovery
+probability.
+
 **Frontend (Next.js)**
 
 ```bash

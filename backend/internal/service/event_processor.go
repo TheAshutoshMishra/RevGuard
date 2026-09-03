@@ -31,6 +31,16 @@ type ProcessResult struct {
 	Diagnosis     *domain.RecoveryDiagnosis
 	Analyzed      bool
 	AnalysisError string
+
+	// EconomicEvaluation describes the result of economic evaluation,
+	// attempted only when Analyzed is true (a diagnosis exists to
+	// evaluate). EconomicEvaluationError is set (and EconomicEvaluation
+	// left nil) when evaluation was attempted but failed; like analysis
+	// failure, this is never treated as an event-processing failure. The
+	// RecoveryCase remains ANALYZED regardless of whether evaluation
+	// succeeds — economic evaluation never changes case status.
+	EconomicEvaluation      *domain.RecoveryEconomicEvaluation
+	EconomicEvaluationError string
 }
 
 // CaseAnalyzer resumes a RecoveryCase from ANALYZING via AI diagnosis.
@@ -40,30 +50,40 @@ type CaseAnalyzer interface {
 	AnalyzeCase(ctx context.Context, recoveryCaseID uuid.UUID, triggeringEventType string) (*AnalysisOutcome, error)
 }
 
-// EventProcessor is the entry point for event ingestion: validate,
-// deduplicate durably against PostgreSQL, persist, correlate to a
-// RecoveryCase via the RecoveryOrchestrator, and — for a freshly created
-// case — trigger AI analysis via the CaseAnalyzer. It is deliberately
-// callable independently of HTTP so a future Redpanda consumer can call
-// it too.
-type EventProcessor struct {
-	pool         *pgxpool.Pool
-	orchestrator *RecoveryOrchestrator
-	analyzer     CaseAnalyzer
-	publisher    EventPublisher
-	logger       *slog.Logger
+// EconomicEvaluator economically evaluates a RecoveryDiagnosis's
+// recommendation. Defined at the point of use so EventProcessor can be
+// tested without a real EconomicEngine.
+type EconomicEvaluator interface {
+	Evaluate(ctx context.Context, recoveryCaseID, recoveryDiagnosisID uuid.UUID) (*EconomicEvaluationOutcome, error)
 }
 
-func NewEventProcessor(pool *pgxpool.Pool, analyzer CaseAnalyzer, publisher EventPublisher, logger *slog.Logger) *EventProcessor {
+// EventProcessor is the entry point for event ingestion: validate,
+// deduplicate durably against PostgreSQL, persist, correlate to a
+// RecoveryCase via the RecoveryOrchestrator, trigger AI analysis via the
+// CaseAnalyzer for a freshly created case, and — once a diagnosis exists
+// — economically evaluate it via the EconomicEvaluator. It is
+// deliberately callable independently of HTTP so a future Redpanda
+// consumer can call it too.
+type EventProcessor struct {
+	pool              *pgxpool.Pool
+	orchestrator      *RecoveryOrchestrator
+	analyzer          CaseAnalyzer
+	economicEvaluator EconomicEvaluator
+	publisher         EventPublisher
+	logger            *slog.Logger
+}
+
+func NewEventProcessor(pool *pgxpool.Pool, analyzer CaseAnalyzer, economicEvaluator EconomicEvaluator, publisher EventPublisher, logger *slog.Logger) *EventProcessor {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &EventProcessor{
-		pool:         pool,
-		orchestrator: NewRecoveryOrchestrator(logger),
-		analyzer:     analyzer,
-		publisher:    publisher,
-		logger:       logger,
+		pool:              pool,
+		orchestrator:      NewRecoveryOrchestrator(logger),
+		analyzer:          analyzer,
+		economicEvaluator: economicEvaluator,
+		publisher:         publisher,
+		logger:            logger,
 	}
 }
 
@@ -176,6 +196,24 @@ func (p *EventProcessor) Process(ctx context.Context, input EventInput) (*Proces
 			if analysisOutcome.Case != nil {
 				result.RecoveryCase = analysisOutcome.Case
 			}
+		}
+	}
+
+	// Economic evaluation, like analysis, happens after commit. Unlike
+	// analysis it involves no external call — see EconomicEngine — but
+	// keeping it as a distinct step (rather than folded into AnalyzeCase)
+	// keeps each concern independently testable and matches "the case
+	// remains ANALYZED after evaluation": nothing here can touch
+	// RecoveryCase.Status. Only attempted once a diagnosis actually
+	// exists to evaluate.
+	if result.Analyzed && result.Diagnosis != nil && p.economicEvaluator != nil {
+		evalOutcome, evalErr := p.economicEvaluator.Evaluate(ctx, outcome.Case.ID, result.Diagnosis.ID)
+		if evalErr != nil {
+			p.logger.Warn("economic evaluation failed",
+				"recovery_case_id", outcome.Case.ID, "recovery_diagnosis_id", result.Diagnosis.ID, "error", evalErr)
+			result.EconomicEvaluationError = evalErr.Error()
+		} else {
+			result.EconomicEvaluation = evalOutcome.Evaluation
 		}
 	}
 

@@ -79,7 +79,7 @@ func TestFullLifecycle_DetectedAnalyzingAnalyzed(t *testing.T) {
 
 	ai := &fakeAIClient{}
 	analyzer := service.NewAnalysisOrchestrator(pool, newContextBuilder(pool), ai, nil)
-	processor := service.NewEventProcessor(pool, analyzer, service.NewLoggingEventPublisher(nil), nil)
+	processor := service.NewEventProcessor(pool, analyzer, nil, service.NewLoggingEventPublisher(nil), nil)
 
 	// The fake client needs to know the case ID before it exists, so
 	// process the event first to create the case in ANALYZING, then wire
@@ -149,7 +149,7 @@ func TestAnalyzeCase_AIFailureLeavesCaseInAnalyzing(t *testing.T) {
 
 	ai := &fakeAIClient{err: service.ErrDiagnosisFailed}
 	analyzer := service.NewAnalysisOrchestrator(pool, newContextBuilder(pool), ai, nil)
-	processor := service.NewEventProcessor(pool, analyzer, service.NewLoggingEventPublisher(nil), nil)
+	processor := service.NewEventProcessor(pool, analyzer, nil, service.NewLoggingEventPublisher(nil), nil)
 
 	input := eventInputFor(payment, "payment.failed")
 	result, err := processor.Process(context.Background(), input)

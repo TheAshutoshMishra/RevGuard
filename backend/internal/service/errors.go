@@ -38,4 +38,13 @@ var (
 	// response failed Go's own validation (malformed JSON, out-of-range
 	// confidence, unknown action/category, missing required field).
 	ErrDiagnosisInvalidResponse = errors.New("service: AI diagnosis response is invalid")
+
+	// ErrRecoveryDiagnosisNotFound means a requested RecoveryDiagnosis
+	// does not exist.
+	ErrRecoveryDiagnosisNotFound = errors.New("service: recovery diagnosis not found")
+
+	// ErrDiagnosisCaseMismatch means a RecoveryDiagnosis was found but
+	// belongs to a different RecoveryCase than the one requested — the
+	// caller passed inconsistent IDs.
+	ErrDiagnosisCaseMismatch = errors.New("service: recovery diagnosis does not belong to the specified recovery case")
 )

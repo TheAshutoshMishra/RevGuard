@@ -40,14 +40,16 @@ backend/            Go core backend
   internal/config/   env-based configuration
   internal/domain/   domain models: Merchant, Customer, Payment, PaymentAttempt,
                      RecoveryCase, RecoveryAction, RecoveryOutcome, RecoveryEvent,
-                     RecoveryDiagnosis, AuditEvent, Money/Currency value types
+                     RecoveryDiagnosis, RecoveryEconomicEvaluation, AuditEvent,
+                     Money/Currency, ProbabilityBasisPoints value types
   internal/http/     HTTP layer (chi router, handlers)
   internal/infrastructure/  thin wrappers around Postgres/Redis/Redpanda
   internal/repository/      Postgres persistence layer (Create/GetByID per entity,
                             DBTX interface so repos run against pool or tx)
   internal/service/         event validation, idempotent ingestion, RecoveryCase
                             state machine, RecoveryOrchestrator, EventPublisher,
-                            RecoveryContextBuilder, AIClient, AnalysisOrchestrator
+                            RecoveryContextBuilder, AIClient, AnalysisOrchestrator,
+                            EconomicEngine, RecoveryProbabilityEstimator, ActionEconomics
   migrations/         SQL migrations (golang-migrate up/down pairs, one per table)
 ai-service/          Python FastAPI AI/ML/LLM service
   app/main.py         FastAPI app + /health + POST /v1/diagnose
@@ -58,8 +60,10 @@ ai-service/          Python FastAPI AI/ML/LLM service
 frontend/            Next.js + TypeScript frontend
 deployments/         deployment configuration (future use)
 docs/architecture/   architecture notes/diagrams (event-flow.md: Milestone 2 pipeline;
-                     ai-diagnosis.md: Milestone 3 AI diagnosis pipeline)
-docs/decisions/      ADRs
+                     ai-diagnosis.md: Milestone 3 AI diagnosis pipeline;
+                     economic-engine.md: Milestone 4 economic evaluation pipeline)
+docs/decisions/      ADRs (0001: recovery probability vs. AI confidence, and why the
+                     Economic Engine doesn't decide)
 scripts/             dev/ops scripts
 tests/               cross-service/integration tests
 docker-compose.yml   local dev orchestration for all services
@@ -514,12 +518,214 @@ Every diagnosis produced during verification (tests and the manual
 end-to-end run) came from `MockProvider` and is clearly labeled as such
 (`provider: "mock"`, `model: "mock-rule-based-v1"` on every stored row).
 
-### Milestone 4 — Economic Engine: NOT STARTED
+### Milestone 4 — Economic Engine: COMPLETE
+
+Goal: deterministically evaluate whether a `RecoveryDiagnosis`'s
+recommendation has positive expected economic value. The case remains
+`ANALYZED` before and after evaluation — no policy decision, no
+execution, no state transition toward `POLICY_CHECK`. Full design
+rationale and formulas:
+[`docs/architecture/economic-engine.md`](./docs/architecture/economic-engine.md);
+architecture decision record:
+[`docs/decisions/0001-economic-engine-probability-vs-confidence.md`](./docs/decisions/0001-economic-engine-probability-vs-confidence.md).
+
+- [x] **Economic domain model**
+      (`backend/internal/domain/probability.go`,
+      `recovery_economic_evaluation.go`): `ProbabilityBasisPoints` (int32,
+      0–10000, validated) and `RecoveryEconomicEvaluation` (revenue at
+      risk, recovery probability, expected gross recovery, action cost,
+      risk cost — all `domain.Money`, i.e. non-negative — plus a signed
+      `ExpectedIncrementalValueMinorUnits int64`, deliberately not `Money`
+      since it can be negative).
+- [x] **AI confidence is NOT recovery probability** — a deliberate,
+      documented architectural boundary (see the ADR). `EconomicEngine`
+      never reads `RecoveryDiagnosis.Confidence`.
+- [x] **`RecoveryProbabilityEstimator`** interface
+      (`backend/internal/service/recovery_probability_estimator.go`) +
+      `HeuristicProbabilityEstimator` (`estimator_name="heuristic"`,
+      `estimator_version="heuristic-v1"`) — deterministic, rule-based,
+      explicitly NOT machine learning, makes NO calls to the AI service
+      or anywhere else. Formula: per-failure-category base rate ×
+      per-action multiplier, minus penalties for repeated payment
+      attempts and prior recovery actions, clamped to [0, 10000]. Every
+      coefficient is documented in-line as an illustrative assumption,
+      not a measured benchmark.
+- [x] **`ActionEconomics`** (`backend/internal/service/action_economics.go`):
+      one entry per `domain.RecommendedAction` (all six — no new values
+      added), each with a fixed `ActionCostMinorUnits` and a
+      `RiskCostBps`. `EconomicModelVersion = "economic-model-v1"`.
+      Illustrative RevGuard-v1 demonstration defaults, explicitly not
+      real Razorpay costs. Unknown actions rejected
+      (`ErrUnknownRecommendedAction`), never silently defaulted.
+- [x] **Formulas** (`backend/internal/service/economic_calculations.go`,
+      pure functions, no I/O): `expected_gross_recovery = revenue_at_risk
+      * probability_bps / 10000`; `risk_cost = revenue_at_risk *
+      risk_cost_bps / 10000`; `expected_incremental_value =
+      expected_gross_recovery - action_cost - risk_cost`. Rounding:
+      standard Go integer division on non-negative operands (floor for
+      non-negative values) — the only rounding rule anywhere in the
+      engine.
+- [x] **Database**: migration `000013` adds `recovery_economic_evaluations`
+      (new table; no Milestone 1–3 migration modified) — FKs to
+      `recovery_cases`/`recovery_diagnoses`, `BIGINT` monetary columns,
+      `INTEGER` probability with a `CHECK (0 <= x <= 10000)`, a `CHECK`
+      mirroring the six `RecommendedAction` values, and
+      `UNIQUE(recovery_diagnosis_id)` — the idempotency guarantee.
+- [x] **`EconomicEngine`** (`backend/internal/service/economic_engine.go`,
+      `Evaluate(ctx, recoveryCaseID, recoveryDiagnosisID)`): loads the
+      case and diagnosis, validates the diagnosis belongs to the case
+      (`ErrDiagnosisCaseMismatch`) and is structurally valid, checks
+      idempotency, loads payment attempts + prior recovery actions,
+      calls the estimator, looks up action economics, computes all four
+      figures, persists the evaluation, writes an
+      `AuditEvent` (`recovery_economics.evaluated`, `ActorType: SYSTEM`).
+      Makes no external network call, so — unlike `AnalyzeCase`'s
+      two-phase structure for the AI call — does all of its work,
+      reads included, inside **one** short transaction.
+- [x] **Idempotency**: `RecoveryEconomicEvaluationRepository.TryCreate`
+      uses `INSERT ... ON CONFLICT (recovery_diagnosis_id) DO NOTHING` —
+      unlike a plain `INSERT` hitting a real unique-violation error, this
+      never errors and never poisons the transaction, so no `SAVEPOINT`
+      is needed (contrast with Milestone 2's case-creation race, which
+      does need one). A new diagnosis (re-analysis) gets its own,
+      independent evaluation row.
+- [x] **Orchestration integration**: `EventProcessor.Process` calls the
+      new `EconomicEvaluator` interface (satisfied by `*EconomicEngine`)
+      immediately after a successful AI analysis
+      (`result.Analyzed && result.Diagnosis != nil`) — a distinct step
+      from `AnalysisOrchestrator`, not a modification to it.
+      `ProcessResult` gained `EconomicEvaluation`/`EconomicEvaluationError`
+      fields, mirroring the `Diagnosis`/`AnalysisError` pattern from
+      Milestone 3. Evaluation failure does not fail the `POST /events`
+      request, same rationale as AI-analysis failure.
+- [x] **Read endpoint**: `GET /v1/recovery-cases/{id}/economic-evaluation`
+      (`backend/internal/http/economic_evaluation.go`) — minimal,
+      read-only, returns the latest evaluation for a case. No endpoint
+      exists (or was added) to approve, execute, or otherwise act on an
+      evaluation.
+- [x] Explicitly NOT implemented (by design, per milestone scope): policy
+      engine, `ALLOW`/`BLOCK`/`ESCALATE` decisions, policy thresholds,
+      payment execution, Razorpay API calls, webhooks, reconciliation,
+      any transition out of `ANALYZED`. `EconomicEngine` has no code path
+      toward any of these.
+
+**Tests (58 total across the Go suite pass, 0 failing, with
+`TEST_DATABASE_URL` set — see "Verification performed" below for the
+no-DB count):**
+- `backend/internal/domain/probability_test.go`: 0, 1, 5000, 9999, 10000
+  accepted; -1, -5000, 10001, 20000 rejected.
+- `backend/internal/domain/money_test.go`: normal amount, zero, a large
+  value (beyond int32 range, confirming `int64`), currency preservation,
+  negative rejected, invalid currency codes rejected.
+- `backend/internal/service/economic_calculations_test.go` (internal
+  `package service` test file, so it can call the unexported
+  `calculate*` functions directly): expected-gross-recovery and
+  risk-cost formulas including an explicit floor-rounding case
+  (`100 * 3333 / 10000 = 33.33 -> 33`), and incremental value for
+  positive/zero/negative outcomes (gross recovery >, ==, and < costs).
+- `recovery_probability_estimator_test.go`: every one of the 7 failure
+  categories and all 6 recommended actions produce an in-range result;
+  `stop_recovery` is always exactly 0 bps regardless of category;
+  identical inputs called twice produce identical output
+  (determinism); more attempts/prior actions strictly lowers probability;
+  unknown failure category/action rejected.
+- `action_economics_test.go`: all 6 `RecommendedAction` values have
+  non-negative cost/risk economics; unknown action rejected;
+  `stop_recovery` has zero cost/risk.
+- `economic_engine_test.go` (integration, `TEST_DATABASE_URL`): full
+  evaluation flow with field-by-field verification (case/diagnosis IDs,
+  recommended action, revenue at risk, probability in range, gross
+  recovery matches the formula recomputed independently in the test,
+  incremental value matches, estimator/model version strings, case
+  status unchanged, one audit row); idempotency (evaluate the same
+  diagnosis twice -> one evaluation row, one audit row, same evaluation
+  ID both times); case not found; diagnosis not found; diagnosis
+  belonging to a different case than requested
+  (`ErrDiagnosisCaseMismatch`); two different diagnoses for the same
+  case get two independent evaluation rows; `GetLatestEvaluation`
+  returns `ErrNotFound` before any evaluation exists and the correct row
+  after.
+
+**Verification performed:**
+- `gofmt -l .`, `go build ./...`, `go vet ./...` — clean.
+- `go test ./...` with no `TEST_DATABASE_URL` — all non-DB-gated tests
+  pass; DB-gated tests skip cleanly (established pattern since
+  Milestone 1).
+- `TEST_DATABASE_URL=postgres://revguard:revguard@localhost:5432/revguard?sslmode=disable
+  go test ./... -v`: **58 tests pass, 0 fail**, across
+  `internal/domain`, `internal/http`, `internal/repository`,
+  `internal/service` — this count includes every Milestone 0–4 Go test;
+  nothing regressed.
+- `ai-service/`: confirmed zero git changes (`git status --short
+  ai-service/` empty) and all 36 Python tests still pass — the AI service
+  was not touched, per this milestone's scope.
+- Migration `000013` applied cleanly on top of the existing Milestone
+  1–3 schema (now at version 13) against the native Postgres instance
+  (`localhost:5432`, `revguard`/`revguard` — same fallback used since
+  Milestone 0, Docker still non-functional in this sandbox for the same
+  reason documented there).
+- **Full cross-service manual smoke test** with real (non-Docker,
+  non-mocked at the process level) `ai-service` (`AI_PROVIDER=mock`, port
+  8126) and Go backend (port 8183) against native Postgres: seeded a
+  merchant/customer/payment/payment_attempt (`insufficient_funds`) via
+  `psql`, `POST /events` with a `payment.failed` event returned `201`
+  with `case_status: "ANALYZED"` on the first call. Exact observed
+  values (recorded here verbatim, not fabricated):
+  `recommended_action=send_payment_link`,
+  `revenue_at_risk_minor_units=49950`, `recovery_probability_bps=3850`
+  (base 3500 for `insufficient_funds` × 110% multiplier for
+  `send_payment_link`), `expected_gross_recovery_minor_units=19230`
+  (`49950*3850/10000` floored), `action_cost_minor_units=200`,
+  `risk_cost_minor_units=149` (`49950*30/10000` floored),
+  `expected_incremental_value_minor_units=18881`
+  (`19230-200-149`) — every figure hand-verified against the formulas
+  above. `GET /v1/recovery-cases/{id}/economic-evaluation` returned the
+  identical figures. `psql` confirmed: `recovery_cases.status =
+  ANALYZED` (unchanged); one `recovery_economic_evaluations` row with
+  `estimator_name=heuristic`, `estimator_version=heuristic-v1`,
+  `economic_model_version=economic-model-v1`; four `audit_events` in
+  order (`recovery_case.created`/SYSTEM,
+  `recovery_case.transitioned`/SYSTEM for M2's
+  `DETECTED->ANALYZING`, `recovery_case.transitioned`/AI for M3's
+  `ANALYZING->ANALYZED`, `recovery_economics.evaluated`/SYSTEM — new
+  this milestone). Re-ran `EconomicEngine.Evaluate` against the exact
+  same case/diagnosis IDs from this live run (via a temporary
+  `backend/cmd/idemcheck` command, deleted immediately after use) and
+  confirmed `Created=false` with the identical evaluation ID returned,
+  and a direct `psql` count confirmed exactly 1 row — idempotency
+  verified against real HTTP-created state, not just isolated test
+  fixtures.
+- Docker's Postgres/ai-service containers remain non-functional in this
+  sandbox — unchanged limitation since Milestone 0, not a project defect.
+
+**Known limitations:**
+- The probability estimator is an illustrative heuristic with no
+  historical calibration — RevGuard doesn't yet execute any actions or
+  record outcomes, so there's no data to calibrate against. See the ADR.
+- Action cost defaults are applied without currency conversion (INR-only
+  in practice).
+- `GET /v1/recovery-cases/{id}/economic-evaluation` returns only the
+  latest evaluation per case, not full history.
+- No real LLM was re-verified this milestone (unchanged from Milestone
+  3 — no `ANTHROPIC_API_KEY` configured in this sandbox); this milestone
+  did not touch the AI service or its provider abstraction at all.
+
+**Explicitly confirmed NOT implemented this milestone:** policy engine,
+`ALLOW`/`BLOCK`/`ESCALATE` decisions, payment execution, Razorpay API
+calls, payment retries/links as actual side effects, webhooks,
+reconciliation, any Redis-based financial state, dashboard/frontend
+work, machine-learning training, real historical probability
+calibration. The `RecoveryCase` remains `ANALYZED` after economic
+evaluation in every test and in the manual verification above.
+
+### Milestone 5 — Policy & Safety: NOT STARTED
 
 Not yet scoped. Do not begin implementation until explicitly instructed.
-Do not implement the policy engine, expected recovery/incremental value
-calculations, action execution, Razorpay APIs, webhooks, or
-reconciliation until this milestone is explicitly started.
+Milestone 5 will read the `RecoveryEconomicEvaluation` this milestone
+produces (plus the underlying `RecoveryDiagnosis`) and make the
+ALLOW/BLOCK/ESCALATE policy decision, transitioning `RecoveryCase`
+through `POLICY_CHECK`. Do not implement policy thresholds, execution, or
+webhooks until this milestone is explicitly started.
 
 ## Working conventions
 
@@ -570,3 +776,20 @@ reconciliation until this milestone is explicitly started.
 - The AI service (`ai-service/`) has no PostgreSQL/Redis/Redpanda
   credentials and must never be given any — it is a stateless HTTP
   service. Go is the only thing with database credentials.
+- For a "create unless it already exists" idempotency guard, prefer
+  `INSERT ... ON CONFLICT (...) DO NOTHING` over a plain `INSERT` caught
+  with `repository.IsUniqueViolation`: `ON CONFLICT DO NOTHING` never
+  raises an error, so it never poisons the enclosing transaction and the
+  caller can safely re-query for the existing row in the same
+  transaction (see `RecoveryEventRepository.TryCreate` and
+  `RecoveryEconomicEvaluationRepository.TryCreate`). Reserve the
+  plain-`INSERT`-plus-`SAVEPOINT` pattern (see
+  `recovery_orchestrator.go`) for cases where the conflicting row's
+  existence isn't yet certain at write time and you need the outer
+  transaction to survive a real constraint violation.
+- Money/probability/cost values are never float/double anywhere —
+  `domain.Money` (int64 minor units + currency) and
+  `domain.ProbabilityBasisPoints` (int32, 0–10000) are the only
+  representations. A value that can be legitimately negative (e.g.
+  expected incremental value) is a plain signed integer, never
+  `domain.Money`, which rejects negative amounts by construction.
