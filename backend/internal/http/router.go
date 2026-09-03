@@ -26,6 +26,7 @@ func NewRouter(
 	r.Use(middleware.Recoverer)
 
 	r.Get("/health", handleHealth)
+	r.Get("/v1/evaluation", handleGetEvaluation)
 	r.Post("/events", handleCreateEvent(events))
 	r.Get("/v1/recovery-cases/{id}/economic-evaluation", handleGetEconomicEvaluation(economicEvaluations))
 	r.Get("/v1/recovery-cases/{id}/policy-decision", handleGetPolicyDecision(policyDecisions))
