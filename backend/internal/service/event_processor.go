@@ -41,6 +41,16 @@ type ProcessResult struct {
 	// succeeds — economic evaluation never changes case status.
 	EconomicEvaluation      *domain.RecoveryEconomicEvaluation
 	EconomicEvaluationError string
+
+	// PolicyDecision describes the result of policy evaluation, attempted
+	// only when an EconomicEvaluation exists. PolicyEvaluationError is
+	// set (and PolicyDecision left nil) when evaluation was attempted but
+	// failed — the case remains ANALYZED (policy evaluation never
+	// partially transitions it); like analysis/economic-evaluation
+	// failure, this is never treated as an event-processing failure. On
+	// success, RecoveryCase reflects the new ALLOW/BLOCK/ESCALATE status.
+	PolicyDecision        *domain.PolicyDecision
+	PolicyEvaluationError string
 }
 
 // CaseAnalyzer resumes a RecoveryCase from ANALYZING via AI diagnosis.
@@ -57,23 +67,32 @@ type EconomicEvaluator interface {
 	Evaluate(ctx context.Context, recoveryCaseID, recoveryDiagnosisID uuid.UUID) (*EconomicEvaluationOutcome, error)
 }
 
+// PolicyEvaluator deterministically decides ALLOW/BLOCK/ESCALATE for a
+// diagnosed, economically-evaluated recommendation. Defined at the point
+// of use so EventProcessor can be tested without a real PolicyEngine.
+type PolicyEvaluator interface {
+	Evaluate(ctx context.Context, recoveryCaseID, recoveryDiagnosisID, recoveryEconomicEvaluationID uuid.UUID) (*PolicyEvaluationOutcome, error)
+}
+
 // EventProcessor is the entry point for event ingestion: validate,
 // deduplicate durably against PostgreSQL, persist, correlate to a
 // RecoveryCase via the RecoveryOrchestrator, trigger AI analysis via the
-// CaseAnalyzer for a freshly created case, and — once a diagnosis exists
-// — economically evaluate it via the EconomicEvaluator. It is
-// deliberately callable independently of HTTP so a future Redpanda
-// consumer can call it too.
+// CaseAnalyzer for a freshly created case, economically evaluate the
+// resulting diagnosis via the EconomicEvaluator, and finally decide
+// ALLOW/BLOCK/ESCALATE via the PolicyEvaluator. It is deliberately
+// callable independently of HTTP so a future Redpanda consumer can call
+// it too.
 type EventProcessor struct {
 	pool              *pgxpool.Pool
 	orchestrator      *RecoveryOrchestrator
 	analyzer          CaseAnalyzer
 	economicEvaluator EconomicEvaluator
+	policyEvaluator   PolicyEvaluator
 	publisher         EventPublisher
 	logger            *slog.Logger
 }
 
-func NewEventProcessor(pool *pgxpool.Pool, analyzer CaseAnalyzer, economicEvaluator EconomicEvaluator, publisher EventPublisher, logger *slog.Logger) *EventProcessor {
+func NewEventProcessor(pool *pgxpool.Pool, analyzer CaseAnalyzer, economicEvaluator EconomicEvaluator, policyEvaluator PolicyEvaluator, publisher EventPublisher, logger *slog.Logger) *EventProcessor {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -82,6 +101,7 @@ func NewEventProcessor(pool *pgxpool.Pool, analyzer CaseAnalyzer, economicEvalua
 		orchestrator:      NewRecoveryOrchestrator(logger),
 		analyzer:          analyzer,
 		economicEvaluator: economicEvaluator,
+		policyEvaluator:   policyEvaluator,
 		publisher:         publisher,
 		logger:            logger,
 	}
@@ -214,6 +234,28 @@ func (p *EventProcessor) Process(ctx context.Context, input EventInput) (*Proces
 			result.EconomicEvaluationError = evalErr.Error()
 		} else {
 			result.EconomicEvaluation = evalOutcome.Evaluation
+		}
+	}
+
+	// Policy evaluation, like economic evaluation, happens after commit
+	// and involves no external call. Only attempted once an economic
+	// evaluation actually exists to decide on. A policy failure leaves
+	// the case at ANALYZED (PolicyEngine.Evaluate never partially
+	// transitions it) and, like every step above, does not fail the
+	// overall POST /events request — the event/case/diagnosis/evaluation
+	// are all durably recorded regardless of whether policy evaluation
+	// succeeds.
+	if result.EconomicEvaluation != nil && p.policyEvaluator != nil {
+		policyOutcome, policyErr := p.policyEvaluator.Evaluate(ctx, outcome.Case.ID, result.Diagnosis.ID, result.EconomicEvaluation.ID)
+		if policyErr != nil {
+			p.logger.Warn("policy evaluation failed; recovery case remains ANALYZED",
+				"recovery_case_id", outcome.Case.ID, "error", policyErr)
+			result.PolicyEvaluationError = policyErr.Error()
+		} else {
+			result.PolicyDecision = policyOutcome.Decision
+			if policyOutcome.Case != nil {
+				result.RecoveryCase = policyOutcome.Case
+			}
 		}
 	}
 

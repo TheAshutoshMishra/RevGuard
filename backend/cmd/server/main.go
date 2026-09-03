@@ -35,9 +35,11 @@ func main() {
 
 	economicEngine := service.NewEconomicEngine(pool, service.NewHeuristicProbabilityEstimator(), nil)
 
-	processor := service.NewEventProcessor(pool, analyzer, economicEngine, publisher, nil)
+	policyEngine := service.NewPolicyEngine(pool, service.DefaultPolicyConfig, nil)
 
-	router := revguardhttp.NewRouter(processor, economicEngine)
+	processor := service.NewEventProcessor(pool, analyzer, economicEngine, policyEngine, publisher, nil)
+
+	router := revguardhttp.NewRouter(processor, economicEngine, policyEngine)
 
 	addr := ":" + cfg.BackendPort
 	log.Printf("revguard backend listening on %s", addr)

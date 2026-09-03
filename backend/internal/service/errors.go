@@ -47,4 +47,25 @@ var (
 	// belongs to a different RecoveryCase than the one requested — the
 	// caller passed inconsistent IDs.
 	ErrDiagnosisCaseMismatch = errors.New("service: recovery diagnosis does not belong to the specified recovery case")
+
+	// ErrRecoveryEconomicEvaluationNotFound means a requested
+	// RecoveryEconomicEvaluation does not exist.
+	ErrRecoveryEconomicEvaluationNotFound = errors.New("service: recovery economic evaluation not found")
+
+	// ErrEconomicEvaluationCaseMismatch means a RecoveryEconomicEvaluation
+	// was found but belongs to a different RecoveryCase than the one
+	// requested.
+	ErrEconomicEvaluationCaseMismatch = errors.New("service: recovery economic evaluation does not belong to the specified recovery case")
+
+	// ErrEconomicEvaluationDiagnosisMismatch means a
+	// RecoveryEconomicEvaluation was found but was computed for a
+	// different RecoveryDiagnosis than the one requested.
+	ErrEconomicEvaluationDiagnosisMismatch = errors.New("service: recovery economic evaluation does not belong to the specified recovery diagnosis")
+
+	// ErrRecoveryCaseNotAnalyzed means a policy evaluation was requested
+	// for a RecoveryCase that is not currently ANALYZED — either it
+	// hasn't reached that state yet, or it has already moved past it
+	// (e.g. already policy-evaluated with different inputs). Policy
+	// evaluation only ever starts fresh from ANALYZED.
+	ErrRecoveryCaseNotAnalyzed = errors.New("service: recovery case is not in ANALYZED status")
 )
