@@ -70,4 +70,8 @@ type RecoveryEvent struct {
 	Payload       []byte // raw JSON
 	OccurredAt    time.Time
 	CreatedAt     time.Time
+	// RecoveryCaseID is set once this event has been correlated to a
+	// RecoveryCase (Milestone 2). Nil for events that never qualify for
+	// case creation (e.g. payment.succeeded).
+	RecoveryCaseID *uuid.UUID
 }

@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_recovery_cases_open_payment_unique;

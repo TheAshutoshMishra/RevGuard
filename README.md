@@ -111,6 +111,28 @@ Monetary amounts are always integer minor units + an explicit currency code
 (e.g. ₹499.50 → `49950`, `"INR"`) — never floating point. See
 [CLAUDE.md](./CLAUDE.md) for the full schema and rationale.
 
+Event ingestion and recovery orchestration live in `backend/internal/service`
+and are exposed via `POST /events`:
+
+```bash
+curl -X POST http://localhost:8080/events \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_id": "evt-123",
+    "event_type": "payment.failed",
+    "aggregate_type": "payment",
+    "aggregate_id": "<existing payment UUID>",
+    "merchant_id": "<that payment'"'"'s merchant UUID>",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "payload": {"reason": "insufficient_funds"}
+  }'
+```
+
+See [docs/architecture/event-flow.md](./docs/architecture/event-flow.md) for
+the full ingestion → idempotency → recovery case → state machine → audit
+pipeline, including why PostgreSQL (not Redis) is the durable idempotency
+authority.
+
 **AI service (Python)**
 
 ```bash

@@ -6,7 +6,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"revguard/backend/internal/domain"
 )
@@ -20,11 +19,11 @@ type RecoveryActionRepository interface {
 // PostgresRecoveryActionRepository is the PostgreSQL-backed
 // RecoveryActionRepository.
 type PostgresRecoveryActionRepository struct {
-	pool *pgxpool.Pool
+	db DBTX
 }
 
-func NewPostgresRecoveryActionRepository(pool *pgxpool.Pool) *PostgresRecoveryActionRepository {
-	return &PostgresRecoveryActionRepository{pool: pool}
+func NewPostgresRecoveryActionRepository(db DBTX) *PostgresRecoveryActionRepository {
+	return &PostgresRecoveryActionRepository{db: db}
 }
 
 func (r *PostgresRecoveryActionRepository) Create(ctx context.Context, a *domain.RecoveryAction) error {
@@ -34,7 +33,7 @@ func (r *PostgresRecoveryActionRepository) Create(ctx context.Context, a *domain
 			idempotency_key, requested_at, executed_at, created_at
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
-	_, err := r.pool.Exec(ctx, q,
+	_, err := r.db.Exec(ctx, q,
 		a.ID, a.RecoveryCaseID, string(a.ActionType), string(a.Status), a.AttemptNumber,
 		a.IdempotencyKey, a.RequestedAt, a.ExecutedAt, a.CreatedAt)
 	return err
@@ -51,7 +50,7 @@ func (r *PostgresRecoveryActionRepository) GetByID(ctx context.Context, id uuid.
 		actionType string
 		status     string
 	)
-	err := r.pool.QueryRow(ctx, q, id).Scan(
+	err := r.db.QueryRow(ctx, q, id).Scan(
 		&a.ID, &a.RecoveryCaseID, &actionType, &status, &a.AttemptNumber,
 		&a.IdempotencyKey, &a.RequestedAt, &a.ExecutedAt, &a.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {

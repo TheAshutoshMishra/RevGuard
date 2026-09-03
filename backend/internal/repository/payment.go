@@ -6,7 +6,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"revguard/backend/internal/domain"
 )
@@ -19,11 +18,11 @@ type PaymentRepository interface {
 
 // PostgresPaymentRepository is the PostgreSQL-backed PaymentRepository.
 type PostgresPaymentRepository struct {
-	pool *pgxpool.Pool
+	db DBTX
 }
 
-func NewPostgresPaymentRepository(pool *pgxpool.Pool) *PostgresPaymentRepository {
-	return &PostgresPaymentRepository{pool: pool}
+func NewPostgresPaymentRepository(db DBTX) *PostgresPaymentRepository {
+	return &PostgresPaymentRepository{db: db}
 }
 
 func (r *PostgresPaymentRepository) Create(ctx context.Context, p *domain.Payment) error {
@@ -33,7 +32,7 @@ func (r *PostgresPaymentRepository) Create(ctx context.Context, p *domain.Paymen
 			amount_minor_units, currency, status, payment_method, created_at, updated_at
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
-	_, err := r.pool.Exec(ctx, q,
+	_, err := r.db.Exec(ctx, q,
 		p.ID, p.MerchantID, p.CustomerID, p.ExternalPaymentID,
 		p.Amount.MinorUnits, string(p.Amount.Currency), string(p.Status), p.PaymentMethod,
 		p.CreatedAt, p.UpdatedAt)
@@ -51,7 +50,7 @@ func (r *PostgresPaymentRepository) GetByID(ctx context.Context, id uuid.UUID) (
 		currency string
 		status   string
 	)
-	err := r.pool.QueryRow(ctx, q, id).Scan(
+	err := r.db.QueryRow(ctx, q, id).Scan(
 		&p.ID, &p.MerchantID, &p.CustomerID, &p.ExternalPaymentID,
 		&p.Amount.MinorUnits, &currency, &status, &p.PaymentMethod,
 		&p.CreatedAt, &p.UpdatedAt)

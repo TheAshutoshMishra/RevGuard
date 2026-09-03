@@ -6,7 +6,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"revguard/backend/internal/domain"
 )
@@ -20,11 +19,11 @@ type PaymentAttemptRepository interface {
 // PostgresPaymentAttemptRepository is the PostgreSQL-backed
 // PaymentAttemptRepository.
 type PostgresPaymentAttemptRepository struct {
-	pool *pgxpool.Pool
+	db DBTX
 }
 
-func NewPostgresPaymentAttemptRepository(pool *pgxpool.Pool) *PostgresPaymentAttemptRepository {
-	return &PostgresPaymentAttemptRepository{pool: pool}
+func NewPostgresPaymentAttemptRepository(db DBTX) *PostgresPaymentAttemptRepository {
+	return &PostgresPaymentAttemptRepository{db: db}
 }
 
 func (r *PostgresPaymentAttemptRepository) Create(ctx context.Context, a *domain.PaymentAttempt) error {
@@ -34,7 +33,7 @@ func (r *PostgresPaymentAttemptRepository) Create(ctx context.Context, a *domain
 			started_at, completed_at, created_at
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
-	_, err := r.pool.Exec(ctx, q,
+	_, err := r.db.Exec(ctx, q,
 		a.ID, a.PaymentID, a.AttemptNumber, string(a.Status), a.FailureCode, a.FailureReason,
 		a.StartedAt, a.CompletedAt, a.CreatedAt)
 	return err
@@ -50,7 +49,7 @@ func (r *PostgresPaymentAttemptRepository) GetByID(ctx context.Context, id uuid.
 		a      domain.PaymentAttempt
 		status string
 	)
-	err := r.pool.QueryRow(ctx, q, id).Scan(
+	err := r.db.QueryRow(ctx, q, id).Scan(
 		&a.ID, &a.PaymentID, &a.AttemptNumber, &status, &a.FailureCode, &a.FailureReason,
 		&a.StartedAt, &a.CompletedAt, &a.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {

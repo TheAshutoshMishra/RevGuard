@@ -6,7 +6,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"revguard/backend/internal/domain"
 )
@@ -20,11 +19,11 @@ type RecoveryOutcomeRepository interface {
 // PostgresRecoveryOutcomeRepository is the PostgreSQL-backed
 // RecoveryOutcomeRepository.
 type PostgresRecoveryOutcomeRepository struct {
-	pool *pgxpool.Pool
+	db DBTX
 }
 
-func NewPostgresRecoveryOutcomeRepository(pool *pgxpool.Pool) *PostgresRecoveryOutcomeRepository {
-	return &PostgresRecoveryOutcomeRepository{pool: pool}
+func NewPostgresRecoveryOutcomeRepository(db DBTX) *PostgresRecoveryOutcomeRepository {
+	return &PostgresRecoveryOutcomeRepository{db: db}
 }
 
 func (r *PostgresRecoveryOutcomeRepository) Create(ctx context.Context, o *domain.RecoveryOutcome) error {
@@ -34,7 +33,7 @@ func (r *PostgresRecoveryOutcomeRepository) Create(ctx context.Context, o *domai
 			recovered_amount_minor_units, currency, external_reference, observed_at, created_at
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
-	_, err := r.pool.Exec(ctx, q,
+	_, err := r.db.Exec(ctx, q,
 		o.ID, o.RecoveryCaseID, o.RecoveryActionID, string(o.Status),
 		o.RecoveredAmount.MinorUnits, string(o.RecoveredAmount.Currency),
 		o.ExternalReference, o.ObservedAt, o.CreatedAt)
@@ -52,7 +51,7 @@ func (r *PostgresRecoveryOutcomeRepository) GetByID(ctx context.Context, id uuid
 		status   string
 		currency string
 	)
-	err := r.pool.QueryRow(ctx, q, id).Scan(
+	err := r.db.QueryRow(ctx, q, id).Scan(
 		&o.ID, &o.RecoveryCaseID, &o.RecoveryActionID, &status,
 		&o.RecoveredAmount.MinorUnits, &currency, &o.ExternalReference, &o.ObservedAt, &o.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {

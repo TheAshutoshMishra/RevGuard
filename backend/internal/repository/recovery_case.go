@@ -3,10 +3,10 @@ package repository
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"revguard/backend/internal/domain"
 )
@@ -15,16 +15,28 @@ import (
 type RecoveryCaseRepository interface {
 	Create(ctx context.Context, c *domain.RecoveryCase) error
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.RecoveryCase, error)
+	// GetOpenByPaymentID returns the non-CLOSED RecoveryCase for the given
+	// payment, if any. The database enforces at most one such row per
+	// payment (see migration 000011), so this is the correlation lookup
+	// used to decide "create a new case" vs. "attach to the existing one"
+	// for a qualifying revenue-risk event.
+	GetOpenByPaymentID(ctx context.Context, paymentID uuid.UUID) (*domain.RecoveryCase, error)
+	// UpdateStatus performs a guarded state transition: it only updates
+	// the row if its current status still matches `from`, returning
+	// ErrNotFound otherwise (the case moved, was deleted, or never had
+	// that status). Callers should validate the transition with
+	// service.ValidateTransition before calling this.
+	UpdateStatus(ctx context.Context, id uuid.UUID, from, to domain.RecoveryCaseStatus, now time.Time) error
 }
 
 // PostgresRecoveryCaseRepository is the PostgreSQL-backed
 // RecoveryCaseRepository.
 type PostgresRecoveryCaseRepository struct {
-	pool *pgxpool.Pool
+	db DBTX
 }
 
-func NewPostgresRecoveryCaseRepository(pool *pgxpool.Pool) *PostgresRecoveryCaseRepository {
-	return &PostgresRecoveryCaseRepository{pool: pool}
+func NewPostgresRecoveryCaseRepository(db DBTX) *PostgresRecoveryCaseRepository {
+	return &PostgresRecoveryCaseRepository{db: db}
 }
 
 func (r *PostgresRecoveryCaseRepository) Create(ctx context.Context, c *domain.RecoveryCase) error {
@@ -34,7 +46,7 @@ func (r *PostgresRecoveryCaseRepository) Create(ctx context.Context, c *domain.R
 			revenue_at_risk_minor_units, currency, created_at, updated_at, closed_at
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
-	_, err := r.pool.Exec(ctx, q,
+	_, err := r.db.Exec(ctx, q,
 		c.ID, c.MerchantID, c.CustomerID, c.PaymentID, string(c.Status),
 		c.RevenueAtRisk.MinorUnits, string(c.RevenueAtRisk.Currency),
 		c.CreatedAt, c.UpdatedAt, c.ClosedAt)
@@ -52,7 +64,7 @@ func (r *PostgresRecoveryCaseRepository) GetByID(ctx context.Context, id uuid.UU
 		status   string
 		currency string
 	)
-	err := r.pool.QueryRow(ctx, q, id).Scan(
+	err := r.db.QueryRow(ctx, q, id).Scan(
 		&c.ID, &c.MerchantID, &c.CustomerID, &c.PaymentID, &status,
 		&c.RevenueAtRisk.MinorUnits, &currency, &c.CreatedAt, &c.UpdatedAt, &c.ClosedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -64,4 +76,44 @@ func (r *PostgresRecoveryCaseRepository) GetByID(ctx context.Context, id uuid.UU
 	c.Status = domain.RecoveryCaseStatus(status)
 	c.RevenueAtRisk.Currency = domain.Currency(currency)
 	return &c, nil
+}
+
+func (r *PostgresRecoveryCaseRepository) GetOpenByPaymentID(ctx context.Context, paymentID uuid.UUID) (*domain.RecoveryCase, error) {
+	const q = `
+		SELECT id, merchant_id, customer_id, payment_id, status,
+			revenue_at_risk_minor_units, currency, created_at, updated_at, closed_at
+		FROM recovery_cases
+		WHERE payment_id = $1 AND status <> 'CLOSED'`
+	var (
+		c        domain.RecoveryCase
+		status   string
+		currency string
+	)
+	err := r.db.QueryRow(ctx, q, paymentID).Scan(
+		&c.ID, &c.MerchantID, &c.CustomerID, &c.PaymentID, &status,
+		&c.RevenueAtRisk.MinorUnits, &currency, &c.CreatedAt, &c.UpdatedAt, &c.ClosedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.Status = domain.RecoveryCaseStatus(status)
+	c.RevenueAtRisk.Currency = domain.Currency(currency)
+	return &c, nil
+}
+
+func (r *PostgresRecoveryCaseRepository) UpdateStatus(ctx context.Context, id uuid.UUID, from, to domain.RecoveryCaseStatus, now time.Time) error {
+	const q = `
+		UPDATE recovery_cases
+		SET status = $1, updated_at = $2
+		WHERE id = $3 AND status = $4`
+	tag, err := r.db.Exec(ctx, q, string(to), now, id, string(from))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

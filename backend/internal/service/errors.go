@@ -1,0 +1,28 @@
+// Package service contains the application/orchestration layer: event
+// validation, idempotent ingestion, and the RecoveryCase state machine.
+// It coordinates repositories but holds no persistence details itself.
+package service
+
+import "errors"
+
+var (
+	// ErrInvalidEvent means an EventInput failed validation. Wrapped with
+	// fmt.Errorf("%w: <detail>", ErrInvalidEvent) at the point of failure.
+	ErrInvalidEvent = errors.New("service: invalid event")
+
+	// ErrUnsupportedAggregate means the event's aggregate_type cannot be
+	// resolved to a domain entity that recovery cases can attach to.
+	ErrUnsupportedAggregate = errors.New("service: aggregate type is not supported for recovery case correlation")
+
+	// ErrAggregateNotFound means the event's aggregate_id does not
+	// resolve to an existing record.
+	ErrAggregateNotFound = errors.New("service: referenced aggregate does not exist")
+
+	// ErrMerchantMismatch means the resolved aggregate belongs to a
+	// different merchant than the one claimed by the event.
+	ErrMerchantMismatch = errors.New("service: aggregate does not belong to the specified merchant")
+
+	// ErrInvalidTransition means a requested RecoveryCase status change
+	// is not permitted by the state machine.
+	ErrInvalidTransition = errors.New("service: invalid recovery case state transition")
+)
