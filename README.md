@@ -143,6 +143,15 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
+When a `RecoveryCase` reaches `ANALYZING`, the backend calls the AI
+service's `POST /v1/diagnose` for a structured diagnosis and
+recommendation, then moves the case to `ANALYZED`. The AI service only
+ever recommends — it never authorizes or executes anything. Defaults to a
+deterministic mock provider (`AI_PROVIDER=mock`, no credentials needed);
+set `AI_PROVIDER=anthropic` and `ANTHROPIC_API_KEY` for real model calls.
+See [docs/architecture/ai-diagnosis.md](./docs/architecture/ai-diagnosis.md)
+for the full contract.
+
 **Frontend (Next.js)**
 
 ```bash
