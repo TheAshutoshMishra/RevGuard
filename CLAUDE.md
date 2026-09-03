@@ -37,6 +37,8 @@ Concretely:
 backend/            Go core backend
   cmd/server/        main entrypoint (HTTP API)
   cmd/migrate/        migration runner (golang-migrate over backend/migrations)
+  cmd/evaluate/       Milestone 8 evaluation CLI (synthetic, deterministic,
+                     no DB/network — see internal/service/evaluation_*.go)
   internal/config/   env-based configuration
   internal/domain/   domain models: Merchant, Customer, Payment, PaymentAttempt,
                      RecoveryCase, RecoveryAction, RecoveryOutcome, RecoveryEvent,
@@ -55,7 +57,10 @@ backend/            Go core backend
                             WebhookProcessor, WebhookSignatureVerifier (RazorpayWebhookVerifier),
                             ProviderEventParser (RazorpayWebhookParser), ReconciliationEngine,
                             PaymentReconciler (FakeReconciler, RazorpayReconciler),
-                            applyFinancialOutcome (shared by WebhookProcessor/ReconciliationEngine)
+                            applyFinancialOutcome (shared by WebhookProcessor/ReconciliationEngine),
+                            GenerateSyntheticDataset, EvaluationStrategy (FixedRetryStrategy,
+                            StaticRulesStrategy, RevGuardStrategy), RunEvaluation (Milestone 8,
+                            evaluation_*.go — SYNTHETIC, offline, no DB/network)
   migrations/         SQL migrations (golang-migrate up/down pairs, one per table)
 ai-service/          Python FastAPI AI/ML/LLM service
   app/main.py         FastAPI app + /health + POST /v1/diagnose
@@ -71,7 +76,8 @@ docs/architecture/   architecture notes/diagrams (event-flow.md: Milestone 2 pip
                      policy-engine.md: Milestone 5 policy decision pipeline;
                      execution-engine.md: Milestone 6 execution pipeline;
                      webhooks-reconciliation.md: Milestone 7 webhook/reconciliation/
-                     financial-truth pipeline)
+                     financial-truth pipeline; evaluation-engine.md: Milestone 8
+                     SYNTHETIC evaluation/revenue-recovery-proof harness)
 docs/decisions/      ADRs (0001: recovery probability vs. AI confidence, and why the
                      Economic Engine doesn't decide; 0002: why AI recommendation,
                      economic evaluation, and policy authorization are three
@@ -1501,7 +1507,222 @@ policy admin UI, automatic retry campaigns, unrelated refactoring. The
 `VERIFYING -> {SUCCESS, FAILED, UNKNOWN}` edges in every test and in the
 manual verification above.
 
-**Next milestone: Milestone 8.** Not yet scoped. Do not begin
+### Milestone 8 — Evaluation & Revenue Recovery Proof: COMPLETE
+
+Goal: a deterministic, offline evaluation harness proving whether
+RevGuard recovers more incremental revenue than simpler recovery
+strategies, without giving AI financial authority, bypassing
+`PolicyEngine`, modifying the state machine, or touching Milestone 7's
+financial-truth logic. **Every dataset and every result in this
+milestone is SYNTHETIC** — none of it is, or has been validated
+against, live Razorpay production data. Full design rationale, formulas,
+and limitations:
+[`docs/architecture/evaluation-engine.md`](./docs/architecture/evaluation-engine.md).
+
+- [x] **Files created** (all in `backend/`, no M0–M7 file modified):
+      `internal/service/evaluation_dataset.go` (deterministic
+      `SyntheticOpportunity` generator, seeded via `deriveRand(seed,
+      index, salt)`), `evaluation_ground_truth.go` (independent,
+      strategy-blind `computeGroundTruth`, deliberately using a
+      different base-rate table from Milestone 4's
+      `heuristicBaseRateBps` — see the architecture doc's "deliberately
+      independent" rationale), `evaluation_diagnosis.go`
+      (`deterministicDiagnosis`, a rule-based AI-diagnosis stand-in
+      mirroring `ai-service`'s existing `MockProvider` — not a network
+      call, not new AI), `evaluation_strategies.go`
+      (`EvaluationStrategy` interface, `FixedRetryStrategy`,
+      `StaticRulesStrategy`, `RevGuardStrategy`), `evaluation_metrics.go`
+      (`StrategyMetrics`, `aggregateStrategyMetrics`),
+      `evaluation_engine.go` (`EvaluationResult`, `RunEvaluation`,
+      `FormatResultTable`), plus five `evaluation_*_test.go` files;
+      `cmd/evaluate/main.go` (CLI); `docs/architecture/evaluation-engine.md`.
+- [x] **No second RevGuard implementation.** `RevGuardStrategy` calls
+      the real, unmodified `HeuristicProbabilityEstimator.Estimate`
+      (Milestone 4), `GetActionEconomics` +
+      `calculateExpectedGrossRecovery`/`calculateRiskCost`/
+      `calculateExpectedIncrementalValue` (Milestone 4), and
+      `evaluatePolicyRules` + `DefaultPolicyConfig` (Milestone 5) —
+      every formula and threshold is the exact same code the real HTTP
+      pipeline uses. The only new logic is the deterministic AI-diagnosis
+      stand-in (necessary for offline reproducibility — a real AI call
+      would be non-deterministic) and the two independently-implemented
+      baselines.
+- [x] **Deterministic synthetic dataset**
+      (`GenerateSyntheticDataset(seed, count)`): 500–1000+
+      `SyntheticOpportunity` values (amount, currency, failure category,
+      payment method, customer history, previous attempts, previous
+      recovery actions, hours since failure). Every random draw comes
+      from a `*rand.Rand` derived purely from `(seed, index, salt)` —
+      same seed always reproduces the identical dataset
+      (`TestGenerateSyntheticDataset_SameSeedIsIdentical`), different
+      seeds diverge (`TestGenerateSyntheticDataset_DifferentSeedIsDifferent`).
+- [x] **Ground-truth model** (`computeGroundTruth`): independent of every
+      strategy — computed once per opportunity before any strategy runs,
+      stored on `SyntheticDataset`'s unexported `groundTruths` field,
+      which no `EvaluationStrategy.Decide(opportunity)` signature can
+      reach. Uses its own base-rate table (deliberately different from
+      RevGuard's own estimator) plus payment-method/customer-history/
+      attempt/time modifiers, clamped to [0, 10000] bps, then a
+      deterministic random draw decides `Recoverable`.
+- [x] **Baseline 1 (Fixed Retry)** and **Baseline 2 (Static Rules)**
+      (`evaluation_strategies.go`): independently implemented, no shared
+      estimator/diagnosis/policy code with `RevGuardStrategy` — only the
+      real `GetActionEconomics` cost table, since the cost of performing
+      an action is a fact about the action, not a strategic choice.
+- [x] **Fairness/anti-bias**, enforced structurally and tested: all
+      three strategies iterate the same `dataset.Opportunities` slice
+      (`TestFairness_AllStrategiesSeeSameDataset`); decisions are
+      order-independent (`TestFairness_StrategyDecisionOrderIndependent`);
+      baselines are unaffected by RevGuard having run
+      (`TestFairness_BaselinesCannotSeeRevGuardDecisions`); ground truth
+      is unchanged by any strategy run
+      (`TestGroundTruth_IndependentOfStrategy`); no output claims live
+      Razorpay validation (`TestFairness_NoProductionRazorpayClaims`).
+- [x] **Metrics** (`evaluation_metrics.go`, `evaluation_engine.go`) —
+      exact formulas in
+      [`docs/architecture/evaluation-engine.md`](./docs/architecture/evaluation-engine.md#metrics-and-exact-formulas):
+      Revenue At Risk, Potentially Recoverable Revenue, Revenue
+      Recovered, Recovery Rate, Incremental Recovered Revenue, Recovery
+      Cost, Risk Cost, Net Incremental Value, Incremental Net Value,
+      Actions Taken/Blocked, Human Escalations, Unnecessary Actions,
+      Average Attempts, Action Reduction %. All monetary figures are
+      `int64` minor units; only display ratios (`RecoveryRate`,
+      `AverageAttempts`, `ActionReductionPercent`) are `float64`.
+- [x] **Reproducibility**: `RunEvaluation(seed, cases)` is a pure
+      function — no timestamps, no random UUIDs, nothing non-deterministic
+      anywhere in `EvaluationResult`. Verified by
+      `TestRunEvaluation_Reproducible` (full `reflect.DeepEqual` plus a
+      byte-for-byte JSON comparison) and manually via two separate CLI
+      runs diffed with `diff` (see "Verification performed" below).
+- [x] **Machine-readable output**: `EvaluationResult` marshals to the
+      JSON shape in the milestone brief (`dataset`/`strategies`/
+      `comparisons`, plus a `disclaimer` field) via
+      `go run ./cmd/evaluate --seed <seed> --cases <cases> [--output
+      evaluation.json]`. **Human-readable output**:
+      `service.FormatResultTable` renders the CLI table, always printed
+      to stdout by the CLI regardless of `--output`.
+- [x] Explicitly NOT implemented (by design, per milestone scope):
+      Next.js dashboard/charts, ML training/reinforcement learning,
+      Kubernetes, Temporal, a Redpanda consumer, automatic production
+      retry campaigns, customer notifications, human approval/policy
+      admin UI, live Razorpay production integration, a new database or
+      message broker, any M9 work. No M0–M7 file was modified except
+      `CLAUDE.md` (this section) — `git status` confirms
+      `backend/internal/service/{event_processor,execution_engine,
+      webhook_processor,reconciliation_engine,policy_engine,
+      economic_engine}.go` and every other pre-existing file are
+      untouched.
+
+**Test counts:** 46 new tests across the 5 `evaluation_*_test.go` files
+(dataset determinism/bounds/uniqueness, ground-truth determinism/
+clamping/independence, per-strategy decision tests for all three
+strategies including determinism, metrics-formula tests — recovery
+rate, net incremental value, unnecessary actions, all-recoverable,
+all-unrecoverable, zero-opportunity, large monetary values — full
+`RunEvaluation` reproducibility/negative-input/comparison-consistency/
+disclaimer tests, and the 5 fairness/anti-bias tests above). Combined
+with the pre-existing Milestone 0–7 suite, the full `go test ./...`
+(with `TEST_DATABASE_URL` set) run is **203 tests pass, 0 fail**
+(157 from Milestones 0–7, unchanged, + 46 new).
+
+**Actual evaluation results (synthetic, seed 12345, 1000 opportunities —
+recorded here verbatim from a real run, not fabricated or tuned to
+produce a particular outcome):**
+
+```
+Revenue At Risk:               251,664,828 minor units (INR)
+Potentially Recoverable:        79,624,948 minor units (INR)
+
+Strategy       Recovered   Actions  Blocked  Escalated   NetValue   Unnecessary  Rate%   AvgAttempts
+fixed_retry     48,345,280     506      494        0     47,453,814    326      19.21%    1.50
+static_rules     1,784,269      38      962        0      1,754,964     23       0.71%    1.00
+revguard            487,653      34      648      318        464,389     26       0.19%    1.32
+
+vs fixed_retry:  incremental_recovered_revenue=-47,857,627  incremental_net_value=-46,989,425  action_reduction=93.28%
+vs static_rules: incremental_recovered_revenue= -1,296,616  incremental_net_value= -1,290,575  action_reduction=10.53%
+```
+
+**Honest interpretation, not spun:** under `DefaultPolicyConfig`'s
+illustrative Milestone 5 defaults (`MaxAutoAmountMinorUnits` = INR
+1,000.00) against this dataset's illustrative amount range (INR
+50–5,000, so ~81% of opportunities exceed the auto-approval ceiling),
+RevGuard escalates the large majority of opportunities to (unmodeled)
+human review rather than acting automatically. This is a genuine,
+computed consequence of the real policy thresholds — not a bug, not
+tuned, and not hidden: on raw `Revenue Recovered`, RevGuard's automated
+actions recover *less* than the fixed-retry baseline in this specific
+configuration, while taking 93% fewer automated actions and escalating
+318 cases for human judgment instead of blindly acting on them (fixed
+retry: 0 escalations, always acts up to 3 attempts regardless of amount
+or risk). Rule 15 of this milestone's brief ("do not hard-code an
+outcome... the system must calculate the result") is why this number is
+reported as computed rather than adjusted — see
+[`docs/architecture/evaluation-engine.md`](./docs/architecture/evaluation-engine.md#known-limitations)
+for the full discussion of the amount-distribution-vs-policy-threshold
+interaction and how a different (e.g. lower-amount-skewed) dataset or a
+different `PolicyConfig` would change this comparison.
+
+**Repeatability verification:** ran
+`go run ./cmd/evaluate --seed 12345 --cases 1000 --output evaluation.json`
+twice into two separate files and `diff`'d them — byte-for-byte
+identical. `TestRunEvaluation_Reproducible` additionally confirms this
+via `reflect.DeepEqual` and a JSON-string comparison in the automated
+suite.
+
+**Verification performed:**
+- `gofmt -l .` — clean (no files listed).
+- `go build ./...`, `go vet ./...` — clean.
+- `go test ./...` with no `TEST_DATABASE_URL` — all non-DB-gated tests
+  pass, including every new `evaluation_*_test.go` test (they need no
+  database at all); DB-gated M0–M7 tests skip cleanly, as always.
+- `TEST_DATABASE_URL=postgres://revguard:revguard@localhost:5432/revguard?sslmode=disable
+  go test ./... -v`: **203 tests pass, 0 fail** (157 Milestone 0–7 +
+  46 new Milestone 8), across `internal/domain`, `internal/http`,
+  `internal/repository`, `internal/service`.
+- `TEST_DATABASE_URL=... go test ./... -race` — clean, no data races.
+- `ai-service/`: confirmed zero git changes (`git status --short
+  ai-service/` empty) — Milestone 8 is Go-only, per the "Python tests
+  still pass if relevant" checklist item, there is nothing to re-run.
+- Manual CLI run: `go run ./cmd/evaluate --seed 12345 --cases 1000`
+  produced the table and JSON recorded above; a second run with
+  identical arguments produced a byte-identical JSON file (`diff`
+  reported no differences).
+- Migrations: none added this milestone (no schema change — this
+  milestone is entirely in-process, no persistence).
+- Docker's Postgres container remains non-functional in this sandbox —
+  unchanged, pre-existing limitation since Milestone 0, irrelevant to
+  this milestone's verification since M8 needs no database at all; the
+  native Postgres instance was used only to re-run the pre-existing
+  M0–M7 regression suite.
+
+**Known limitations:** see
+[`docs/architecture/evaluation-engine.md`](./docs/architecture/evaluation-engine.md#known-limitations)
+for the full list — in summary: the AI diagnosis step is a deterministic
+rule-based stand-in (mirroring `ai-service`'s own `MockProvider`), not a
+live LLM call; the ground-truth model is an illustrative, uncalibrated
+assumption (RevGuard has no historical outcome data yet to calibrate
+against, same root cause as Milestone 4's own documented limitation);
+`ExecutionEngine`/`WebhookProcessor`/`ReconciliationEngine` are not
+invoked (the ground-truth model stands in for what M6/M7 would
+determine, since those engines require a live database/provider and
+this milestone is explicitly offline); `ESCALATE` never recovers
+revenue in this simulation (no human-approval workflow is modeled);
+currency is INR-only; the synthetic amount distribution and
+`DefaultPolicyConfig`'s auto-approval ceiling interact in a way that
+suppresses RevGuard's automated action count relative to the baselines
+(discussed in detail above and in the architecture doc).
+
+**Confirmations:**
+- Results are SYNTHETIC. No real Razorpay, merchant, or customer data
+  was used anywhere in this milestone.
+- No claim is made, anywhere in code, tests, or this document, that
+  RevGuard has been validated against live Razorpay production data.
+- Milestone 9 was NOT started — no file outside the list above was
+  created or modified.
+- No `git add`/`git commit`/`git push` was performed; the user manages
+  git manually in this project, as in every prior milestone.
+
+**Next milestone: Milestone 9.** Not yet scoped. Do not begin
 implementation until explicitly instructed.
 
 ## Working conventions
