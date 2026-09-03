@@ -163,6 +163,17 @@ pure evaluation. Read it back via
 for the full model, including why AI confidence is not recovery
 probability.
 
+The backend then deterministically decides whether the recommendation is
+authorized to proceed: `ALLOW`, `BLOCK`, or `ESCALATE`, based on a fixed,
+versioned set of rules (confidence, economic value, amount, attempt
+history, and which actions are allowed to run automatically at all) —
+never on AI confidence or a positive economic value alone. This is the
+final authority before execution (a future milestone); nothing is
+executed here. Read it back via
+`GET /v1/recovery-cases/{id}/policy-decision`. See
+[docs/architecture/policy-engine.md](./docs/architecture/policy-engine.md)
+for the full rule set.
+
 **Frontend (Next.js)**
 
 ```bash

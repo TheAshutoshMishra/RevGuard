@@ -40,8 +40,8 @@ backend/            Go core backend
   internal/config/   env-based configuration
   internal/domain/   domain models: Merchant, Customer, Payment, PaymentAttempt,
                      RecoveryCase, RecoveryAction, RecoveryOutcome, RecoveryEvent,
-                     RecoveryDiagnosis, RecoveryEconomicEvaluation, AuditEvent,
-                     Money/Currency, ProbabilityBasisPoints value types
+                     RecoveryDiagnosis, RecoveryEconomicEvaluation, PolicyDecision,
+                     AuditEvent, Money/Currency, ProbabilityBasisPoints value types
   internal/http/     HTTP layer (chi router, handlers)
   internal/infrastructure/  thin wrappers around Postgres/Redis/Redpanda
   internal/repository/      Postgres persistence layer (Create/GetByID per entity,
@@ -49,7 +49,8 @@ backend/            Go core backend
   internal/service/         event validation, idempotent ingestion, RecoveryCase
                             state machine, RecoveryOrchestrator, EventPublisher,
                             RecoveryContextBuilder, AIClient, AnalysisOrchestrator,
-                            EconomicEngine, RecoveryProbabilityEstimator, ActionEconomics
+                            EconomicEngine, RecoveryProbabilityEstimator, ActionEconomics,
+                            PolicyEngine, PolicyConfig, evaluatePolicyRules
   migrations/         SQL migrations (golang-migrate up/down pairs, one per table)
 ai-service/          Python FastAPI AI/ML/LLM service
   app/main.py         FastAPI app + /health + POST /v1/diagnose
@@ -61,9 +62,12 @@ frontend/            Next.js + TypeScript frontend
 deployments/         deployment configuration (future use)
 docs/architecture/   architecture notes/diagrams (event-flow.md: Milestone 2 pipeline;
                      ai-diagnosis.md: Milestone 3 AI diagnosis pipeline;
-                     economic-engine.md: Milestone 4 economic evaluation pipeline)
+                     economic-engine.md: Milestone 4 economic evaluation pipeline;
+                     policy-engine.md: Milestone 5 policy decision pipeline)
 docs/decisions/      ADRs (0001: recovery probability vs. AI confidence, and why the
-                     Economic Engine doesn't decide)
+                     Economic Engine doesn't decide; 0002: why AI recommendation,
+                     economic evaluation, and policy authorization are three
+                     separate layers)
 scripts/             dev/ops scripts
 tests/               cross-service/integration tests
 docker-compose.yml   local dev orchestration for all services
@@ -718,13 +722,227 @@ work, machine-learning training, real historical probability
 calibration. The `RecoveryCase` remains `ANALYZED` after economic
 evaluation in every test and in the manual verification above.
 
-### Milestone 5 — Policy & Safety: NOT STARTED
+### Milestone 5 — Policy & Safety: COMPLETE
+
+Goal: deterministically decide ALLOW/BLOCK/ESCALATE for a diagnosed,
+economically-evaluated recommendation, transitioning
+`ANALYZED -> POLICY_CHECK -> {ALLOW, BLOCK, ESCALATE}`. The Policy Engine
+is the final authority before execution (a future milestone) — it never
+executes anything, never calls the AI service, never calls a payment
+gateway. Full design rationale and rule table:
+[`docs/architecture/policy-engine.md`](./docs/architecture/policy-engine.md);
+architecture decision record:
+[`docs/decisions/0002-three-layer-separation.md`](./docs/decisions/0002-three-layer-separation.md).
+
+- [x] **Policy domain model**
+      (`backend/internal/domain/policy_decision.go`):
+      `PolicyDecisionOutcome` (ALLOW/BLOCK/ESCALATE — deliberately the
+      same strings as the corresponding `RecoveryCaseStatus` values, since
+      the outcome *is* the case's next status, unlike `RecommendedAction`
+      vs. `RecoveryActionType` where the vocabularies were kept distinct
+      on purpose), `PolicyReasonCode` (8 typed codes:
+      `STOP_RECOVERY_RECOMMENDATION`, `LOW_AI_CONFIDENCE`,
+      `NEGATIVE_EXPECTED_VALUE`, `AMOUNT_ABOVE_AUTO_LIMIT`,
+      `MAX_ATTEMPTS_REACHED`, `TOO_MANY_PRIOR_ACTIONS`,
+      `ACTION_NOT_AUTO_ALLOWED`, `POLICY_ALLOWED`), and `PolicyDecision`
+      (references the exact `RecoveryDiagnosisID` and
+      `RecoveryEconomicEvaluationID` evaluated; `AuthorizedAction` set
+      only when `Outcome == ALLOW`; immutable after creation).
+- [x] **Policy configuration**
+      (`backend/internal/service/policy_config.go`, `DefaultPolicyConfig`,
+      version `policy-v1`): `MinimumConfidence` (float64, matching
+      Milestone 3's existing `RecoveryDiagnosis.Confidence` type — not
+      redesigned), `MaxAutoAmountMinorUnits` (int64 — also serves as the
+      "human approval threshold" from the brief; see "one threshold, two
+      names" in the architecture doc for why these were deliberately
+      unified rather than duplicated), `MinimumExpectedIncrementalValueMinorUnits`
+      (int64), `MaxPaymentAttempts`/`MaxPriorRecoveryActions` (int),
+      `AutoAllowedActions` (`map[domain.RecommendedAction]bool`). All
+      monetary fields are integer minor units; nothing is float except
+      `MinimumConfidence`, matching M3's existing contract. Thresholds are
+      documented illustrative RevGuard defaults, not claimed production
+      Razorpay policy.
+- [x] **Deterministic rules** (`backend/internal/service/policy_rules.go`,
+      `evaluatePolicyRules` — pure function, no I/O): evaluates every
+      rule (does not short-circuit), collects every triggered reason
+      code, and picks the final outcome by severity
+      (BLOCK > ESCALATE > ALLOW), not evaluation order. `ALLOW` only
+      happens when zero rules fire. See the architecture doc's rule
+      table for the exact 7 rules (B–H) and the merge of rule I into E.
+- [x] **Database**: migration `000014` adds `policy_decisions` (new
+      table; no Milestone 1–4 migration modified) — FKs to
+      `recovery_cases`/`recovery_diagnoses`/`recovery_economic_evaluations`,
+      `CHECK` on `decision` (3 values) and `authorized_action` (6 values
+      or NULL), and
+      `UNIQUE(recovery_case_id, recovery_diagnosis_id,
+      recovery_economic_evaluation_id, policy_version)` — the idempotency
+      guarantee, exactly the composite key the milestone brief specified.
+- [x] **`PolicyEngine`** (`backend/internal/service/policy_engine.go`,
+      `Evaluate(ctx, recoveryCaseID, recoveryDiagnosisID,
+      recoveryEconomicEvaluationID)`): idempotency check first (before
+      any other validation — see the architecture doc for why this
+      ordering matters), then loads/validates case+diagnosis+evaluation
+      ownership, requires `RecoveryCase.Status == ANALYZED`, evaluates
+      rules, persists the decision, performs both state-machine hops
+      (`ANALYZED -> POLICY_CHECK -> <outcome>`) via the existing
+      Milestone 2 `ValidateTransition`/guarded `UpdateStatus`, writes an
+      audit event, commits — all in **one** transaction (no external call
+      exists in this engine at all, unlike `AnalysisOrchestrator`'s AI
+      call).
+- [x] **State machine**: no change — `ANALYZED -> POLICY_CHECK ->
+      {ALLOW, BLOCK, ESCALATE}` was already declared in
+      `state_machine.go` since Milestone 2. `ALLOW -> EXECUTING`,
+      `BLOCK -> CLOSED`, `ESCALATE -> *` remain unimplemented (`ESCALATE`
+      still has no outgoing edge), exactly as designed for later
+      milestones.
+- [x] **Idempotency & concurrency**:
+      `PolicyDecisionRepository.TryCreate` uses
+      `INSERT ... ON CONFLICT (...) DO NOTHING` (same pattern as
+      Milestone 4's `RecoveryEconomicEvaluationRepository.TryCreate`) —
+      never errors on conflict, so no `SAVEPOINT` is needed for the race
+      fallback (contrast with Milestone 2's case-creation race).
+      PostgreSQL's unique constraint is the sole authority; no Redis lock
+      introduced.
+- [x] **Orchestration integration**:
+      `EventProcessor.Process` calls the new `PolicyEvaluator` interface
+      (satisfied by `*PolicyEngine`) immediately after a successful
+      economic evaluation. `ProcessResult` gained
+      `PolicyDecision`/`PolicyEvaluationError` fields, mirroring the
+      `Diagnosis`/`Analysis*` and `EconomicEvaluation`/`Economic*`
+      pattern from Milestones 3–4. **Chosen failure behavior** (per the
+      milestone's explicit request to document this): a policy evaluation
+      failure does not fail `POST /events` (the event/case/diagnosis/
+      evaluation are already durable regardless), leaves the case at
+      `ANALYZED` (never partially transitioned), and creates **no**
+      `PolicyDecision` row — never a fabricated default decision.
+- [x] **Read endpoint**: `GET /v1/recovery-cases/{id}/policy-decision`
+      (`backend/internal/http/policy_decision.go`) — minimal, read-only,
+      latest decision for a case. No approve/override/execute capability
+      anywhere.
+- [x] Explicitly NOT implemented (by design, per milestone scope):
+      execution of any kind, Razorpay API calls, payment retries/links as
+      real side effects, customer communication, webhooks,
+      reconciliation, Redis-based financial state, policy admin UI,
+      machine learning, any transition beyond
+      `ALLOW`/`BLOCK`/`ESCALATE`. Every integration test asserts zero
+      `recovery_actions` rows after every decision.
+
+**Tests (96 total across the Go suite pass, 0 failing, with
+`TEST_DATABASE_URL` set — up from 58 after Milestone 4, so ~38 new tests
+this milestone, zero regressions):**
+- `backend/internal/domain/policy_decision_test.go`: valid/invalid
+  `PolicyDecisionOutcome` and `PolicyReasonCode` values; a dedicated test
+  asserting `PolicyDecisionOutcome`'s three string values exactly match
+  the corresponding `RecoveryCaseStatus` strings (guards the intentional
+  coupling `PolicyEngine.Evaluate` relies on).
+- `backend/internal/service/policy_rules_test.go` (internal `package
+  service` test file, so it can call `evaluatePolicyRules` directly, no
+  database): one test per rule (stop_recovery→BLOCK, low
+  confidence→ESCALATE, negative expected value→BLOCK, zero expected
+  value→BLOCK when minimum is configured positive, amount above auto
+  limit→ESCALATE, max payment attempts→BLOCK, too many prior
+  actions→ESCALATE, action not auto-allowed→ESCALATE, safe case→ALLOW);
+  a multi-reason test proving BLOCK outranks ESCALATE when both fire and
+  both reason codes are recorded; determinism (identical input twice →
+  identical output); and 8 explicit boundary tests (confidence exactly
+  at threshold vs. one unit below; expected value exactly at threshold
+  vs. one unit below; amount exactly at limit vs. one minor unit above;
+  attempts exactly at maximum vs. one below) — all exact integer/float
+  comparisons, no approximation.
+- `backend/internal/service/policy_engine_test.go` (integration,
+  `TEST_DATABASE_URL`): successful evaluation reaching each of
+  ALLOW/BLOCK/ESCALATE with full field verification (decision fields,
+  case status, `AuthorizedAction` set only for ALLOW); diagnosis/case
+  mismatch; evaluation/case mismatch; evaluation/diagnosis mismatch
+  (evaluation computed for a different diagnosis than requested); missing
+  evaluation; case not found; case not in ANALYZED status; idempotency
+  (evaluate twice → one row, one audit row, identical decision ID and
+  fields both times — immutability); **5-goroutine concurrent evaluation**
+  of the identical input tuple → exactly one decision row, exactly one
+  `Created=true`, all five converge on the same decision ID, final case
+  status consistent; `GetLatestDecision` read path; and every ALLOW/BLOCK/
+  ESCALATE test asserts zero `recovery_actions` rows (no execution) plus
+  the `recovery_policy.evaluated` audit event.
+
+**Verification performed:**
+- `gofmt -l .`, `go build ./...`, `go vet ./...` — clean.
+- `go test ./...` with no `TEST_DATABASE_URL` — all non-DB-gated tests
+  pass; DB-gated tests skip cleanly.
+- `TEST_DATABASE_URL=postgres://revguard:revguard@localhost:5432/revguard?sslmode=disable
+  go test ./... -v`: **96 tests pass, 0 fail**, across `internal/domain`,
+  `internal/http`, `internal/repository`, `internal/service` — every
+  Milestone 0–5 Go test; nothing regressed.
+- `ai-service/`: confirmed zero git changes and all 36 Python tests still
+  pass — the AI service was not touched.
+- Migration `000014` applied cleanly on native Postgres (now at version
+  14).
+- **Full cross-service manual smoke test**, real (non-Docker) `ai-service`
+  (`AI_PROVIDER=mock`, port 8127) + Go backend (port 8184) + native
+  Postgres: seeded a merchant/customer/payment/payment_attempt
+  (`insufficient_funds`) via `psql`, `POST /events` with a
+  `payment.failed` event returned `201` with `case_status: "ALLOW"` on
+  the *first* call — the entire
+  `DETECTED -> ANALYZING -> ANALYZED -> economic evaluation ->
+  POLICY_CHECK -> ALLOW` pipeline completing within one HTTP request.
+  This is the genuine outcome of the deterministic rules against
+  `DefaultPolicyConfig` and the mock provider's real diagnosis — it was
+  not tuned to force this result (see the milestone brief's explicit
+  instruction not to). `GET /v1/recovery-cases/{id}/policy-decision`
+  returned `decision=ALLOW, authorized_action=send_payment_link,
+  policy_version=policy-v1, reason_codes=[POLICY_ALLOWED]`, with a full
+  `Explanation` string showing every threshold compared
+  (`confidence=0.750 (min=0.600)`,
+  `revenue_at_risk_minor_units=49950 (max_auto=100000)`,
+  `expected_incremental_value_minor_units=18881 (min=0)`,
+  `payment_attempts=1 (max=3)`, `prior_actions=0 (max=2)`). `psql`
+  confirmed: `recovery_cases.status = ALLOW`; one `policy_decisions` row
+  with those exact values; five `audit_events` in order
+  (`recovery_case.created`/SYSTEM, `recovery_case.transitioned`/SYSTEM
+  for M2, `recovery_case.transitioned`/AI for M3,
+  `recovery_economics.evaluated`/SYSTEM for M4,
+  `recovery_policy.evaluated`/SYSTEM — new this milestone); **zero**
+  `recovery_actions` rows (no execution occurred). Re-ran
+  `PolicyEngine.Evaluate` against the exact same case/diagnosis/evaluation
+  IDs from this live run (via a temporary `backend/cmd/idemcheck`
+  command, deleted immediately after use): `Created=false`, identical
+  decision ID returned, `psql` confirmed exactly 1 row — idempotency
+  verified against real HTTP-created state, not just isolated fixtures.
+- Docker's Postgres/ai-service containers remain non-functional in this
+  sandbox — unchanged limitation since Milestone 0, not a project defect.
+
+**Known limitations:**
+- Policy thresholds (`DefaultPolicyConfig`) are illustrative RevGuard-v1
+  defaults, not derived from historical loss data or real risk modeling.
+- The "human approval threshold" and "maximum automatic recovery amount"
+  from the milestone brief were deliberately unified into one config
+  field (`MaxAutoAmountMinorUnits`) rather than duplicated — see "one
+  threshold, two names" in the architecture doc.
+- `PriorRecoveryActionCount` is always 0 in current practice, since
+  nothing in the codebase creates `RecoveryAction` rows yet (execution is
+  Milestone 6) — the rule (G) exists and is fully unit-tested for when
+  that changes, but has not been exercised against real non-zero prior
+  actions in the integration/e2e tests (only in the pure rule tests,
+  which pass an explicit count).
+- No real LLM was re-verified this milestone (unchanged from Milestones
+  3–4); this milestone did not touch the AI service at all.
+
+**Explicitly confirmed NOT implemented this milestone:** payment
+execution, Razorpay API calls, payment retries/links as real side
+effects, customer communication, webhooks, reconciliation, Redis-based
+financial state, Redpanda consumer infrastructure, frontend/dashboard,
+policy admin UI, machine learning, historical probability calibration,
+automatic human-approval workflows, manual override functionality. The
+`RecoveryCase` never transitions past `ALLOW`/`BLOCK`/`ESCALATE`, and no
+`RecoveryAction` is ever created, in every test and in the manual
+verification above.
+
+### Milestone 6 — Execution Engine: NOT STARTED
 
 Not yet scoped. Do not begin implementation until explicitly instructed.
-Milestone 5 will read the `RecoveryEconomicEvaluation` this milestone
-produces (plus the underlying `RecoveryDiagnosis`) and make the
-ALLOW/BLOCK/ESCALATE policy decision, transitioning `RecoveryCase`
-through `POLICY_CHECK`. Do not implement policy thresholds, execution, or
+Milestone 6 will read an `ALLOW` `PolicyDecision`'s `AuthorizedAction` and
+actually perform it (payment retry, payment link send, etc.) via
+Razorpay, transitioning `RecoveryCase` through `EXECUTING` ->
+`VERIFYING`. Do not implement payment execution, Razorpay integration, or
 webhooks until this milestone is explicitly started.
 
 ## Working conventions
@@ -793,3 +1011,19 @@ webhooks until this milestone is explicitly started.
   representations. A value that can be legitimately negative (e.g.
   expected incremental value) is a plain signed integer, never
   `domain.Money`, which rejects negative amounts by construction.
+- For an idempotent multi-step `Evaluate`-style engine (EconomicEngine,
+  PolicyEngine), check for an existing result for the exact input tuple
+  **before** validating the current state of anything else. The target
+  entity's *current* state (e.g. `RecoveryCase.Status` no longer being
+  the "must be in this state to start" value) is often a direct, expected
+  consequence of the prior successful call this request is safely
+  retrying — validating state before checking idempotency will wrongly
+  reject that retry as an error. See `PolicyEngine.Evaluate`'s ordering
+  and its doc comment.
+- When a decision/evaluation engine can trigger more than one independent
+  rule, prefer evaluating every rule and collecting every triggered
+  reason (with the final outcome decided by severity, e.g.
+  BLOCK > ESCALATE > ALLOW) over short-circuiting on the first match —
+  see `evaluatePolicyRules`. Short-circuiting hides secondary reasons
+  that matter for auditability ("why" should list everything that
+  applied, not just whichever check happened to run first).
