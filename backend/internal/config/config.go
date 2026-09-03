@@ -25,6 +25,15 @@ type Config struct {
 
 	AIServiceURL     string
 	AIRequestTimeout time.Duration
+
+	// PaymentProvider selects the ExecutionEngine's PaymentProvider
+	// implementation: "fake" (default, safe for local/dev/demo — no
+	// external network calls) or "razorpay" (requires RazorpayKeyID and
+	// RazorpayKeySecret; see service.NewRazorpayProvider).
+	PaymentProvider   string
+	RazorpayKeyID     string
+	RazorpayKeySecret string
+	RazorpayBaseURL   string
 }
 
 // Load reads configuration from environment variables, applying sensible
@@ -46,6 +55,11 @@ func Load() Config {
 
 		AIServiceURL:     getEnv("AI_SERVICE_URL", "http://localhost:8000"),
 		AIRequestTimeout: getEnvSeconds("AI_REQUEST_TIMEOUT_SECONDS", 20),
+
+		PaymentProvider:   getEnv("PAYMENT_PROVIDER", "fake"),
+		RazorpayKeyID:     getEnv("RAZORPAY_KEY_ID", ""),
+		RazorpayKeySecret: getEnv("RAZORPAY_KEY_SECRET", ""),
+		RazorpayBaseURL:   getEnv("RAZORPAY_BASE_URL", ""),
 	}
 }
 

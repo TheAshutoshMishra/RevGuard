@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 
@@ -39,12 +40,34 @@ func main() {
 
 	processor := service.NewEventProcessor(pool, analyzer, economicEngine, policyEngine, publisher, nil)
 
-	router := revguardhttp.NewRouter(processor, economicEngine, policyEngine)
+	paymentProvider, err := buildPaymentProvider(cfg)
+	if err != nil {
+		log.Fatalf("failed to build payment provider: %v", err)
+	}
+	executionEngine := service.NewExecutionEngine(pool, paymentProvider, nil)
+
+	router := revguardhttp.NewRouter(processor, economicEngine, policyEngine, executionEngine)
 
 	addr := ":" + cfg.BackendPort
 	log.Printf("revguard backend listening on %s", addr)
 
 	if err := http.ListenAndServe(addr, router); err != nil {
 		log.Fatalf("server error: %v", err)
+	}
+}
+
+// buildPaymentProvider selects the ExecutionEngine's PaymentProvider based
+// on config.PaymentProvider. Defaults to the fake provider, which makes no
+// external network calls and is safe for local development — a
+// misconfigured "razorpay" selection without credentials fails fast at
+// startup rather than silently falling back to fake.
+func buildPaymentProvider(cfg config.Config) (service.PaymentProvider, error) {
+	switch cfg.PaymentProvider {
+	case "", "fake":
+		return service.NewFakeProvider(service.FakeProviderScenarioSuccess), nil
+	case "razorpay":
+		return service.NewRazorpayProvider(cfg.RazorpayKeyID, cfg.RazorpayKeySecret, cfg.RazorpayBaseURL, nil)
+	default:
+		return nil, fmt.Errorf("unknown PAYMENT_PROVIDER %q (expected \"fake\" or \"razorpay\")", cfg.PaymentProvider)
 	}
 }
