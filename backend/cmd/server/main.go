@@ -36,7 +36,11 @@ func main() {
 
 	economicEngine := service.NewEconomicEngine(pool, service.NewHeuristicProbabilityEstimator(), nil)
 
-	policyEngine := service.NewPolicyEngine(pool, service.DefaultPolicyConfig, nil)
+	policyConfig, ok := service.PolicyProfiles[cfg.PolicyProfile]
+	if !ok {
+		log.Fatalf("unknown POLICY_PROFILE %q (expected one of: conservative, balanced, aggressive)", cfg.PolicyProfile)
+	}
+	policyEngine := service.NewPolicyEngine(pool, policyConfig, nil)
 
 	processor := service.NewEventProcessor(pool, analyzer, economicEngine, policyEngine, publisher, nil)
 

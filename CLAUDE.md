@@ -1625,6 +1625,17 @@ with the pre-existing Milestone 0–7 suite, the full `go test ./...`
 (with `TEST_DATABASE_URL` set) run is **203 tests pass, 0 fail**
 (157 from Milestones 0–7, unchanged, + 46 new).
 
+**Superseded by Milestone 9.** The specific figures below reflect
+Milestone 8's original simulation, which did not yet model Milestone 6's
+real retry_payment-only execution coverage or Milestone 7's UNKNOWN
+outcome. Milestone 9 closed both gaps, which changed RevGuard's specific
+numbers for the same seed (more conservative, since some previously
+"executed" actions are now correctly recorded as unsupported or
+ambiguous). See the Milestone 9 section below for the current
+methodology and current numbers; the figures immediately below are kept
+as a historical record of what Milestone 8 actually measured at the
+time, not as current results.
+
 **Actual evaluation results (synthetic, seed 12345, 1000 opportunities —
 recorded here verbatim from a real run, not fabricated or tuned to
 produce a particular outcome):**
@@ -1722,7 +1733,246 @@ suppresses RevGuard's automated action count relative to the baselines
 - No `git add`/`git commit`/`git push` was performed; the user manages
   git manually in this project, as in every prior milestone.
 
-**Next milestone: Milestone 9.** Not yet scoped. Do not begin
+### Milestone 9 — Evaluation & Benchmarking Refinement: COMPLETE
+
+Goal: close two real production-fidelity gaps in Milestone 8's
+evaluation harness so RevGuard's simulated strategy matches production
+behavior more closely, add the metrics/report deliverables the
+milestone brief specifically required, and re-run the evaluation
+honestly — without touching M0–M8's actual production code, the
+PolicyEngine's formulas, the state machine, or M7's financial-truth
+logic. **Every dataset and every result in this milestone remains
+SYNTHETIC**, exactly as in Milestone 8.
+
+**Why this milestone is mostly refinement, not a rebuild:** inspecting
+the repository at the start of this milestone showed Milestone 8 had
+already built the entire evaluation architecture the brief describes
+(deterministic synthetic dataset, two independent baselines, a RevGuard
+strategy reusing the real economic/policy formulas, JSON + table output,
+fairness tests, architecture doc). Two real gaps remained between that
+simulation and actual production behavior — see below — plus report/
+metric deliverables (`Expected Recovery Value`, `Incremental Recovery
+Rate`, a Markdown report) the M9 brief asked for explicitly that M8
+hadn't produced. This milestone closed exactly those gaps rather than
+re-deriving the architecture from scratch.
+
+- [x] **Gap 1 — execution-capability fidelity.** Milestone 8's
+      simulation treated any policy `ALLOW` as if it executed. In
+      production, Milestone 6's `ExecutionEngine` only ever implemented
+      `retry_payment` — every other authorized action is rejected with
+      `ErrActionNotExecutable` before any side effect (a real, already-
+      documented Milestone 6 limitation). Fixed via
+      `isRevGuardActionExecutable` (`evaluation_strategies.go`), which
+      mirrors `ExecutionEngine.phase1`'s exact check. `StrategyDecision`
+      gained `Executed bool`: an `ALLOW` for `retry_payment` sets
+      `Executed = true` with real cost/risk; an `ALLOW` for anything else
+      (e.g. `send_payment_link`, which genuinely reaches `ALLOW` under
+      `DefaultPolicyConfig` — confirmed in Milestone 5's own
+      verification) stays authorized but `Executed = false`, zero cost,
+      zero possible recovery. Applies only to `RevGuardStrategy` — the
+      baselines don't route through RevGuard's `ExecutionEngine` and
+      aren't bound by its current implementation coverage.
+- [x] **Gap 2 — ambiguous/UNKNOWN financial outcomes.** Milestone 8's
+      ground truth was strictly binary (recoverable or not), with no
+      equivalent of Milestone 6/7's real UNKNOWN outcome (provider
+      timeout at execution time, or an unresolved reconciliation
+      lookup — never guessed into SUCCESS/FAILED). Fixed via
+      `groundTruthResult.ObservationAmbiguous` (`evaluation_ground_truth.go`,
+      independent deterministic draw, illustrative 4% rate,
+      `groundTruthAmbiguousRateBps`) and `resolveFinancialOutcome`
+      (`evaluation_metrics.go`), which reuses `domain.RecoveryOutcomeStatus`'s
+      exact `SUCCESS`/`FAILED`/`UNKNOWN` vocabulary (Milestone 1/7)
+      rather than inventing a parallel one.
+- [x] **New metrics** (`StrategyMetrics`, `ComparisonResult`):
+      `ExpectedRecoveryValueMinorUnits` (RevGuard's Economic Engine's
+      ex-ante prediction, `calculateExpectedGrossRecovery`, recorded for
+      every `ALLOW` regardless of execution capability — always 0 for
+      the baselines, which have no economic model), `UnsupportedActions`
+      (count of `ALLOW`-but-not-`Executed`), `AmbiguousOutcomes` (count
+      of `Executed`-but-`UNKNOWN`), and `IncrementalRecoveryRate`
+      (`revguard.RecoveryRate - baseline.RecoveryRate`, distinct from
+      the absolute `IncrementalRecoveredRevenueMinorUnits`).
+      `UnnecessaryActions` was narrowed to mean `Executed AND
+      resolveFinancialOutcome == FAILED` specifically — an unresolved
+      (`UNKNOWN`) executed action is no longer conflated with a
+      definitively wasted one. Every opportunity now lands in exactly
+      one of six mutually-exclusive buckets (blocked / escalated /
+      unsupported / recovered / unnecessary / ambiguous) — see
+      `TestAggregateStrategyMetrics_NoDoubleCounting`.
+- [x] **Markdown report** (`FormatMarkdownReport`,
+      `backend/internal/service/evaluation_engine.go`): generated
+      sections — run metadata (generated-at timestamp, `--commit` code/
+      version identifier, seed, scenario count, dataset type),
+      assumptions, strategy definitions, a full metrics table, the
+      RevGuard-vs-baseline comparison table, an interpretation
+      paragraph, limitations, and the mandatory "Synthetic evaluation —
+      not production performance" label. **Deliberately not part of
+      `EvaluationResult`**: the timestamp and commit hash are supplied
+      by the caller and rendered only at report-generation time, so
+      `EvaluationResult`'s own determinism guarantee (same seed/cases ->
+      byte-identical JSON) is unaffected — verified by running the CLI
+      twice with different `--commit` values and diffing the JSON output
+      (identical) while the Markdown differs only in its metadata line.
+- [x] **CLI** (`backend/cmd/evaluate/main.go`) gained `--markdown-output`
+      (write the Markdown report to a file, else print to stdout) and
+      `--commit` (optional caller-supplied label, e.g. from `git
+      rev-parse --short HEAD` — the binary itself never invokes git).
+      `--seed`/`--cases`/`--output` are unchanged from Milestone 8.
+- [x] **No second RevGuard implementation, no production code touched.**
+      `PolicyEngine`, the state machine, `EconomicEngine`,
+      `WebhookProcessor`, `ReconciliationEngine`, and every M0–M8 file
+      outside `backend/internal/service/evaluation_*.go`,
+      `backend/cmd/evaluate/main.go`, and this document are unmodified —
+      confirmed via `git diff --stat` against the Milestone 8 commit
+      showing changes contained to exactly those files (plus the
+      architecture doc).
+- [x] **Dashboard integration: none, by design.** The frontend
+      (`frontend/`) was inspected and confirmed still at its Milestone 0
+      skeleton state (no analytics/evaluation presentation hooks of any
+      kind — `git grep` for evaluation/benchmark-related terms in
+      `frontend/` returns nothing outside build artifacts). Per this
+      milestone's explicit instruction ("if M8 already has hooks,
+      integrate; otherwise do NOT redesign the dashboard"), no frontend
+      file was created, modified, or even inspected beyond this check.
+- [x] Explicitly NOT implemented (by design, per milestone scope): new
+      AI models, ML training, production automatic retries, new payment
+      flows, live Razorpay payment execution, webhook/reconciliation/
+      policy redesign, human approval UI, Kubernetes, Temporal, new
+      databases/message brokers, unnecessary microservices, production
+      load-testing infrastructure, unrelated frontend redesign, any M10
+      work.
+
+**Test counts:** 11 new tests added on top of Milestone 8's 46
+(executability-gating tests for `RevGuardStrategy`, ambiguous-outcome
+determinism/rate/no-double-counting/no-recovery tests for the new
+ground-truth field and metrics, `ExpectedRecoveryValue`/
+`IncrementalRecoveryRate` formula tests, and two `FormatMarkdownReport`
+tests) — **57 evaluation-specific tests total.** Combined with the
+unchanged Milestone 0–7 suite (157), the full `go test ./...` (with
+`TEST_DATABASE_URL` set) run is **214 tests pass, 0 fail**.
+
+**Actual evaluation results (synthetic, seed 12345, 1000 opportunities,
+current methodology — recorded here verbatim from a real run):**
+
+```
+Revenue At Risk:               251,664,828 minor units (INR)
+Potentially Recoverable:        79,624,948 minor units (INR)
+
+Strategy       Recovered   Actions  Blocked  Escalated  Unsupported  Ambiguous   NetValue   Unnecessary  Rate%   AvgAttempts
+fixed_retry     47,563,828     506      494        0            0         15    46,672,362      315     18.90%    1.50
+static_rules     1,746,191      38      962        0            0          2     1,716,886       22      0.69%    1.00
+revguard            351,570      26      648      318            8          1       331,183       19      0.14%    1.27
+
+vs fixed_retry:  incremental_recovered_revenue=-47,212,258  incremental_net_value=-46,341,179  action_reduction=94.86%  incremental_recovery_rate=-0.1876
+vs static_rules: incremental_recovered_revenue= -1,394,621  incremental_net_value= -1,385,703  action_reduction=31.58%  incremental_recovery_rate=-0.0055
+
+revguard ExpectedRecoveryValueMinorUnits (ex-ante prediction, all ALLOW decisions incl. unsupported): 941,188
+```
+
+**Honest interpretation, not spun:** RevGuard's numbers dropped from
+Milestone 8's run for the same seed (487,653 -> 351,570 recovered; 34 ->
+26 actions taken) precisely because the two fidelity fixes are more
+conservative: 8 of RevGuard's `ALLOW` decisions were `send_payment_link`
+(authorized, but not currently executable per Milestone 6 — recorded as
+`UnsupportedActions`, not silently credited), and 1 executed action came
+back `UNKNOWN` rather than being guessed into success. This is the
+intended, honest effect of aligning the simulation with the real
+system's current implementation coverage, not a regression or a result
+that was tuned to look worse. RevGuard's raw `Revenue Recovered` remains
+below both baselines' in this specific configuration (same root cause
+identified in Milestone 8: `DefaultPolicyConfig.MaxAutoAmountMinorUnits`
+= INR 1,000 vs. this dataset's INR 50–5,000 amount range, so most
+opportunities escalate to unmodeled human review), while taking 94.86%
+and 31.58% fewer actions respectively than the two baselines. Separately,
+RevGuard's `ExpectedRecoveryValueMinorUnits` (941,188 — the Economic
+Engine's ex-ante prediction across all its `ALLOW` decisions, including
+the 8 unsupported ones) is markedly higher than its realized
+`RevenueRecoveredMinorUnits` (351,570): part of that gap is the
+independently-tuned, deliberately-imperfect ground-truth model (see
+Milestone 8's "why not reuse RevGuard's own base-rate table" rationale),
+and part is that the Economic Engine's prediction is computed before
+Milestone 6's execution-capability check, so it includes revenue the
+system cannot currently act on at all — a genuine, calibration-relevant
+finding this evaluation surfaces rather than hides.
+
+**Repeatability verification:** ran
+`go run ./cmd/evaluate --seed 12345 --cases 1000 --output evaluation.json`
+twice (once with `--commit abc`, once with a different value) and
+`diff`'d the two JSON files — byte-for-byte identical, confirming the
+new `--commit`/Markdown-report parameters have zero effect on the
+deterministic result. `TestRunEvaluation_Reproducible` continues to
+verify this via `reflect.DeepEqual` and a JSON-string comparison in the
+automated suite.
+
+**Verification performed:**
+- `gofmt -l .` — clean (no files listed).
+- `go build ./...`, `go vet ./...` — clean.
+- `go test ./...` with no `TEST_DATABASE_URL` — all non-DB-gated tests
+  pass, including all 57 evaluation tests (none need a database).
+- `TEST_DATABASE_URL=postgres://revguard:revguard@localhost:5432/revguard?sslmode=disable
+  go test ./... -v`: **214 tests pass, 0 fail** (157 Milestone 0–7 +
+  57 Milestone 8–9 evaluation tests), across `internal/domain`,
+  `internal/http`, `internal/repository`, `internal/service`.
+- `TEST_DATABASE_URL=... go test ./... -race` — clean, no data races.
+- `ai-service/`: zero changes — Milestone 9 is Go-only, same as
+  Milestone 8.
+- Manual CLI run: `go run ./cmd/evaluate --seed 12345 --cases 1000
+  --output evaluation.json --markdown-output evaluation.md --commit
+  8b42747` produced the table, JSON, and Markdown report recorded above
+  and in `docs/architecture/evaluation-engine.md`; a second run with
+  identical `--seed`/`--cases` (different `--commit`) produced a
+  byte-identical JSON file (`diff` reported no differences) and a
+  Markdown report differing only in its metadata line, as expected.
+- No output files (`evaluation.json`/`evaluation.md`) were left in the
+  repository working tree — both were generated into a scratch
+  directory outside the repo for verification purposes only, consistent
+  with "no temporary/debug artifacts" and Milestone 4–7's precedent of
+  deleting one-off verification tools after use.
+- Frontend: confirmed no dashboard/evaluation hooks exist; no frontend
+  file was touched.
+- Migrations: none added — this milestone changes no schema, same as
+  Milestone 8.
+
+**Known limitations:** all of Milestone 8's limitations still apply
+(deterministic AI-diagnosis stand-in, uncalibrated ground-truth model,
+INR-only, the amount-distribution-vs-policy-threshold interaction) —
+see the architecture doc's "Known limitations" for the full, current
+list. Two are newly added this milestone: the real execution/webhook/
+reconciliation *code paths* are still not invoked (only their
+documented behavioral contracts are modeled); the 4% ambiguous-outcome
+rate is an illustrative assumption, not a measured Razorpay reliability
+figure.
+
+**Confirmations:**
+- Results are SYNTHETIC. No real Razorpay, merchant, or customer data
+  was used anywhere in this milestone.
+- No claim is made, anywhere in code, tests, or this document, that
+  RevGuard has been validated against live Razorpay production data.
+- No real Razorpay financial action was executed — this milestone opens
+  no network connection and calls no external API at all.
+- Milestone 10 was NOT started — no file outside the list above was
+  created or modified.
+- No `git init`/`git add`/`git commit`/`git push`/branch-creation was
+  performed by this work; the user manages git manually in this
+  project, as in every prior milestone. (A commit titled "working on
+  dashboard" appears in this session's `git log` — that was made by the
+  user directly, not by this work, and touched no file this milestone
+  didn't already account for.)
+
+**Recommended next milestone:** Milestone 10 — not yet scoped. Natural
+candidates surfaced by this milestone's honest results (not a
+commitment, just observations for whoever scopes it next): (a)
+extending `ExecutionEngine` to cover more than `retry_payment`, which
+this evaluation shows leaves real predicted value
+(`ExpectedRecoveryValueMinorUnits`) uncaptured; (b) revisiting whether
+`DefaultPolicyConfig.MaxAutoAmountMinorUnits` should scale with a
+merchant's actual payment-amount distribution rather than one fixed
+illustrative ceiling; (c) a genuinely presentational (read-only)
+dashboard surface for evaluation results, once there is real interest in
+making this data visible in the frontend. Do not begin implementation
+until explicitly instructed.
+
+**Next milestone: Milestone 10.** Not yet scoped. Do not begin
 implementation until explicitly instructed.
 
 ## Working conventions

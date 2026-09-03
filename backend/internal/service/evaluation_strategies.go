@@ -193,23 +193,43 @@ func (s *StaticRulesStrategy) Decide(opp SyntheticOpportunity) (StrategyDecision
 //     calculateRiskCost / calculateExpectedIncrementalValue
 //     (action_economics.go, economic_calculations.go, Milestone 4) —
 //     untouched,
-//   - evaluatePolicyRules + DefaultPolicyConfig (policy_rules.go,
-//     policy_config.go, Milestone 5) — untouched.
+//   - evaluatePolicyRules + a PolicyConfig (policy_rules.go,
+//     policy_config.go, Milestones 5 and 10) — untouched.
 //
 // No second, parallel implementation of the economic or policy logic
 // exists anywhere in this file: every formula and threshold comes from
 // the exact same functions the real HTTP pipeline calls.
+//
+// Milestone 10 parameterized RevGuardStrategy by PolicyConfig (rather
+// than always using DefaultPolicyConfig) so the evaluation harness can
+// compare RevGuard's own conservative/balanced/aggressive risk profiles
+// (see policy_config.go) against each other and against the baselines —
+// the policy RULES (evaluatePolicyRules) are identical across every
+// profile; only the threshold VALUES differ.
 // ---------------------------------------------------------------------
 
 type RevGuardStrategy struct {
-	estimator *HeuristicProbabilityEstimator
+	name         string
+	policyConfig PolicyConfig
+	estimator    *HeuristicProbabilityEstimator
 }
 
+// NewRevGuardStrategy returns the strategy under DefaultPolicyConfig,
+// named "revguard" — preserved exactly as Milestone 8/9 defined it, for
+// existing tests and callers that don't need multiple profiles.
 func NewRevGuardStrategy() *RevGuardStrategy {
-	return &RevGuardStrategy{estimator: NewHeuristicProbabilityEstimator()}
+	return NewRevGuardStrategyWithProfile("revguard", DefaultPolicyConfig)
 }
 
-func (s *RevGuardStrategy) Name() string { return "revguard" }
+// NewRevGuardStrategyWithProfile (Milestone 10) builds a RevGuard
+// strategy under an explicit PolicyConfig and a distinct name (e.g.
+// "revguard_conservative") — used by RunEvaluation to compare RevGuard's
+// three named risk profiles under the exact same synthetic dataset.
+func NewRevGuardStrategyWithProfile(name string, config PolicyConfig) *RevGuardStrategy {
+	return &RevGuardStrategy{name: name, policyConfig: config, estimator: NewHeuristicProbabilityEstimator()}
+}
+
+func (s *RevGuardStrategy) Name() string { return s.name }
 
 func (s *RevGuardStrategy) Decide(opp SyntheticOpportunity) (StrategyDecision, error) {
 	diag := deterministicDiagnosis(opp)
@@ -250,7 +270,7 @@ func (s *RevGuardStrategy) Decide(opp SyntheticOpportunity) (StrategyDecision, e
 		ExpectedIncrementalValueMinorUnits: incremental,
 	}
 
-	ruleResult := evaluatePolicyRules(DefaultPolicyConfig, PolicyRuleInput{
+	ruleResult := evaluatePolicyRules(s.policyConfig, PolicyRuleInput{
 		Diagnosis:                diagnosis,
 		EconomicEvaluation:       evaluation,
 		PaymentAttemptCount:      opp.PreviousAttempts,
@@ -273,18 +293,19 @@ func (s *RevGuardStrategy) Decide(opp SyntheticOpportunity) (StrategyDecision, e
 	return decision, nil
 }
 
-// isRevGuardActionExecutable mirrors ExecutionEngine.phase1's real,
-// current check (backend/internal/service/execution_engine.go:
-// "if decision.AuthorizedAction != domain.RecommendedActionRetryPayment
-// { return nil, ErrActionNotExecutable }") — Milestone 6 only
-// implemented execution for retry_payment. A policy ALLOW for any other
-// action is genuinely authorized (Outcome stays ALLOW) but cannot
-// actually run yet in production, so this evaluation must not credit
-// RevGuard with cost or recovery it could not really have produced.
-// This check applies only to RevGuardStrategy: the baselines don't route
-// through RevGuard's ExecutionEngine at all, so they aren't bound by its
-// current implementation coverage (see StrategyDecision.Executed's doc
-// comment).
+// isRevGuardActionExecutable reuses executableActions — the exact same
+// map ExecutionEngine.phase1 (execution_engine.go) consults to decide
+// ErrActionNotExecutable — so this evaluation's notion of "can RevGuard
+// really execute this" can never silently drift from what the real
+// ExecutionEngine actually does. As of Milestone 10, that's
+// retry_payment and send_payment_link; an action outside this map is
+// genuinely policy-authorized (Outcome stays ALLOW) but cannot actually
+// run yet in production, so this evaluation must not credit RevGuard
+// with cost or recovery it could not really have produced. This check
+// applies only to RevGuardStrategy: the baselines don't route through
+// RevGuard's ExecutionEngine at all, so they aren't bound by its current
+// implementation coverage (see StrategyDecision.Executed's doc comment).
 func isRevGuardActionExecutable(action domain.RecommendedAction) bool {
-	return action == domain.RecommendedActionRetryPayment
+	_, ok := executableActions[action]
+	return ok
 }

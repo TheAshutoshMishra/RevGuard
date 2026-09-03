@@ -24,6 +24,23 @@ import (
 // a racing caller — see docs/architecture/execution-engine.md.
 const executionStaleAfter = 30 * time.Second
 
+// executableActions is the complete, authoritative list of
+// domain.RecommendedAction values ExecutionEngine can actually carry
+// out, mapped to the domain.RecoveryActionType persisted on the
+// resulting RecoveryAction. Milestone 6 shipped only retry_payment;
+// Milestone 10 added send_payment_link via the same PaymentProvider
+// abstraction (see PaymentProvider.SendPaymentLink). An AuthorizedAction
+// not in this map is genuinely authorized by policy but has no
+// execution implementation yet — ErrActionNotExecutable, never a
+// fabricated result. Extending real execution coverage to a new action
+// is exactly "add an entry here, add the matching case in Execute's
+// provider dispatch, add the matching PaymentProvider method" — no
+// other engine code changes.
+var executableActions = map[domain.RecommendedAction]domain.RecoveryActionType{
+	domain.RecommendedActionRetryPayment:    domain.RecoveryActionTypeRetryPayment,
+	domain.RecommendedActionSendPaymentLink: domain.RecoveryActionTypeSendPaymentLink,
+}
+
 // ExecutionOutcome describes what Execute did.
 type ExecutionOutcome struct {
 	Action *domain.RecoveryAction
@@ -78,7 +95,8 @@ func NewExecutionEngine(pool *pgxpool.Pool, provider PaymentProvider, logger *sl
 //     can never reach execution.
 //  4. It has a non-empty, valid AuthorizedAction (ErrMissingAuthorizedAction).
 //  5. That action has a real execution implementation
-//     (ErrActionNotExecutable) — only retry_payment in Milestone 6.
+//     (ErrActionNotExecutable) — retry_payment (Milestone 6) and
+//     send_payment_link (Milestone 10); see executableActions.
 //  6. The RecoveryCase currently is ALLOW (ErrRecoveryCaseNotAllow) —
 //     ANALYZED/DETECTED/BLOCK/ESCALATE/SUCCESS/FAILED/CLOSED all reject.
 //
@@ -97,17 +115,41 @@ func (e *ExecutionEngine) Execute(ctx context.Context, recoveryCaseID, policyDec
 		return &ExecutionOutcome{Action: p1.action, Case: p1.recoveryCase, Created: false}, nil
 	}
 
-	// PHASE 2: outside any transaction.
+	// PHASE 2: outside any transaction. Dispatches to the PaymentProvider
+	// method matching p1.action.ActionType (set from executableActions in
+	// phase1); both methods report through the same
+	// success/reference/error-code shape, converted to RetryPaymentResult
+	// here purely so phase3's persistence/state-transition logic (which
+	// is action-type-agnostic — it only cares about Succeeded/reference/
+	// error-code) never needs to know which provider method was called.
 	started := time.Now()
 	e.logger.Info("execution provider call started",
 		"recovery_case_id", recoveryCaseID, "recovery_action_id", p1.action.ID,
 		"authorized_action", string(p1.action.ActionType), "provider", e.provider.Name())
-	result, providerErr := e.provider.RetryPayment(ctx, RetryPaymentRequest{
-		IdempotencyKey:    p1.action.IdempotencyKey,
-		ExternalPaymentID: p1.externalPaymentID,
-		AmountMinorUnits:  p1.amountMinorUnits,
-		Currency:          p1.currency,
-	})
+
+	var result RetryPaymentResult
+	var providerErr error
+	switch p1.action.ActionType {
+	case domain.RecoveryActionTypeSendPaymentLink:
+		var linkResult SendPaymentLinkResult
+		linkResult, providerErr = e.provider.SendPaymentLink(ctx, SendPaymentLinkRequest{
+			IdempotencyKey:    p1.action.IdempotencyKey,
+			ExternalPaymentID: p1.externalPaymentID,
+			AmountMinorUnits:  p1.amountMinorUnits,
+			Currency:          p1.currency,
+		})
+		result = RetryPaymentResult{
+			Succeeded: linkResult.Succeeded, ProviderReference: linkResult.ProviderReference,
+			ErrorCode: linkResult.ErrorCode, ErrorMessage: linkResult.ErrorMessage,
+		}
+	default:
+		result, providerErr = e.provider.RetryPayment(ctx, RetryPaymentRequest{
+			IdempotencyKey:    p1.action.IdempotencyKey,
+			ExternalPaymentID: p1.externalPaymentID,
+			AmountMinorUnits:  p1.amountMinorUnits,
+			Currency:          p1.currency,
+		})
+	}
 	latency := time.Since(started)
 	e.logger.Info("execution provider call finished",
 		"recovery_case_id", recoveryCaseID, "recovery_action_id", p1.action.ID,
@@ -156,11 +198,12 @@ func (e *ExecutionEngine) phase1(ctx context.Context, recoveryCaseID, policyDeci
 	if decision.AuthorizedAction == "" || !decision.AuthorizedAction.Valid() {
 		return nil, fmt.Errorf("%w: decision %s", ErrMissingAuthorizedAction, decision.ID)
 	}
-	// Only retry_payment has a real execution implementation in
-	// Milestone 6. The policy decision is still respected: nothing is
+	// Only actions in executableActions have a real execution
+	// implementation. The policy decision is still respected: nothing is
 	// executed, no fabricated result is produced, and this is reported
 	// as a clear, typed error.
-	if decision.AuthorizedAction != domain.RecommendedActionRetryPayment {
+	actionType, executable := executableActions[decision.AuthorizedAction]
+	if !executable {
 		return nil, fmt.Errorf("%w: %s", ErrActionNotExecutable, decision.AuthorizedAction)
 	}
 
@@ -202,7 +245,7 @@ func (e *ExecutionEngine) phase1(ctx context.Context, recoveryCaseID, policyDeci
 	newAction := &domain.RecoveryAction{
 		ID:             uuid.New(),
 		RecoveryCaseID: recoveryCaseID,
-		ActionType:     domain.RecoveryActionTypeRetryPayment,
+		ActionType:     actionType,
 		Status:         domain.RecoveryActionStatusExecuting,
 		AttemptNumber:  1,
 		IdempotencyKey: idempotencyKey,

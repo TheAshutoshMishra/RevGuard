@@ -57,6 +57,34 @@ func TestComputeGroundTruth_ScoreClampedAtMax(t *testing.T) {
 	}
 }
 
+func TestComputeGroundTruth_ObservationAmbiguousIsDeterministic(t *testing.T) {
+	opp := SyntheticOpportunity{FailureCategory: domain.FailureCategoryTransientFailure, PaymentMethod: "card"}
+	a := computeGroundTruth(opp, rand.New(rand.NewSource(7)))
+	b := computeGroundTruth(opp, rand.New(rand.NewSource(7)))
+	if a.ObservationAmbiguous != b.ObservationAmbiguous {
+		t.Fatal("ObservationAmbiguous is not deterministic for a fixed rand source")
+	}
+}
+
+func TestComputeGroundTruth_ObservationAmbiguousIsRare(t *testing.T) {
+	// Sanity check the illustrative 4% rate is roughly respected across a
+	// large sample — not an exact statistical test, just a guard against
+	// a sign error or unit confusion (e.g. accidentally using bps as a
+	// fraction) that would make "ambiguous" the common case.
+	ambiguous := 0
+	const n = 10000
+	for i := 0; i < n; i++ {
+		r := computeGroundTruth(SyntheticOpportunity{FailureCategory: domain.FailureCategoryTransientFailure}, deriveRand(1, i, saltGroundTruth))
+		if r.ObservationAmbiguous {
+			ambiguous++
+		}
+	}
+	rate := float64(ambiguous) / float64(n)
+	if rate < 0.02 || rate > 0.06 {
+		t.Fatalf("expected ObservationAmbiguous rate near 4%%, got %.2f%% (%d/%d)", rate*100, ambiguous, n)
+	}
+}
+
 // TestGroundTruth_IndependentOfStrategy is the core anti-bias guarantee:
 // the ground truth for a given opportunity must be identical regardless
 // of which strategies have run, in what order, or whether they ran at

@@ -42,6 +42,9 @@ func TestFixedRetryStrategy_RetriesUnderMaxAttempts(t *testing.T) {
 	if d.Action != domain.RecommendedActionRetryPayment {
 		t.Fatalf("expected retry_payment, got %s", d.Action)
 	}
+	if !d.Executed {
+		t.Fatal("fixed_retry assumes full execution capability and must be Executed on ALLOW")
+	}
 	if d.ActionCostMinorUnits <= 0 {
 		t.Fatal("expected positive action cost")
 	}
@@ -83,6 +86,9 @@ func TestStaticRulesStrategy_AllowsQualifyingCategory(t *testing.T) {
 	}
 	if d.Action != domain.RecommendedActionRetryPayment {
 		t.Fatalf("expected retry_payment for transient_failure, got %s", d.Action)
+	}
+	if !d.Executed {
+		t.Fatal("static_rules assumes full execution capability and must be Executed on ALLOW")
 	}
 }
 
@@ -221,5 +227,129 @@ func TestRevGuardStrategy_AllowOnlySetsCostWhenAllowed(t *testing.T) {
 	})
 	if blocked.ActionCostMinorUnits != 0 || blocked.RiskCostMinorUnits != 0 {
 		t.Fatal("a BLOCK decision must carry zero cost")
+	}
+	if blocked.Executed {
+		t.Fatal("a BLOCK decision must never be Executed")
+	}
+}
+
+// TestRevGuardStrategy_SendPaymentLinkIsNowExecuted covers Milestone
+// 10's execution-fidelity change: send_payment_link is genuinely
+// policy-ALLOWed (DefaultPolicyConfig.AutoAllowedActions has it set
+// true) AND, as of Milestone 10, ExecutionEngine actually implements it
+// (see executableActions in execution_engine.go). RevGuardStrategy must
+// credit real cost/possible recovery for it now, unlike Milestone 8/9
+// when only retry_payment was executable.
+func TestRevGuardStrategy_SendPaymentLinkIsNowExecuted(t *testing.T) {
+	s := NewRevGuardStrategy()
+	opp := SyntheticOpportunity{
+		AmountMinorUnits:        50_000,
+		Currency:                "INR",
+		FailureCategory:         domain.FailureCategoryInsufficientFunds,
+		PreviousAttempts:        1,
+		PreviousRecoveryActions: 0,
+	}
+	d := mustDecide(t, s, opp)
+
+	if d.Outcome != domain.PolicyDecisionOutcomeAllow {
+		t.Fatalf("expected ALLOW, got %s", d.Outcome)
+	}
+	if d.Action != domain.RecommendedActionSendPaymentLink {
+		t.Fatalf("expected send_payment_link, got %s", d.Action)
+	}
+	if !d.Executed {
+		t.Fatal("send_payment_link has a real execution implementation as of Milestone 10 and must be Executed")
+	}
+	if d.ActionCostMinorUnits <= 0 {
+		t.Fatal("expected a positive action cost for an executed action")
+	}
+	if d.ExpectedGrossRecoveryMinorUnits <= 0 {
+		t.Fatal("expected a positive ex-ante prediction from the Economic Engine")
+	}
+}
+
+// TestRevGuardStrategy_UnsupportedActionAuthorizedButNotExecuted covers
+// Milestone 9's execution-fidelity fix, still true for actions
+// Milestone 10 did not add execution for: send_reminder can be
+// genuinely policy-ALLOWed under the aggressive profile (its confidence
+// floor of 0.50 is at or below deterministicDiagnosis's fixed 0.55 for
+// customer_abandonment), but ExecutionEngine has no execution
+// implementation for it. RevGuardStrategy must reflect that gap rather
+// than silently crediting cost/recovery for an action that cannot
+// actually run in production.
+func TestRevGuardStrategy_UnsupportedActionAuthorizedButNotExecuted(t *testing.T) {
+	s := NewRevGuardStrategyWithProfile("test_aggressive", AggressivePolicyConfig)
+	opp := SyntheticOpportunity{
+		AmountMinorUnits:        50_000,
+		Currency:                "INR",
+		FailureCategory:         domain.FailureCategoryCustomerAbandonment,
+		PreviousAttempts:        1,
+		PreviousRecoveryActions: 0,
+	}
+	d := mustDecide(t, s, opp)
+
+	if d.Outcome != domain.PolicyDecisionOutcomeAllow {
+		t.Fatalf("expected ALLOW (policy authorization is unaffected by execution capability), got %s", d.Outcome)
+	}
+	if d.Action != domain.RecommendedActionSendReminder {
+		t.Fatalf("expected send_reminder, got %s", d.Action)
+	}
+	if d.Executed {
+		t.Fatal("send_reminder has no execution implementation and must not be Executed")
+	}
+	if d.ActionCostMinorUnits != 0 || d.RiskCostMinorUnits != 0 {
+		t.Fatalf("an unexecuted action must incur zero cost, got cost=%d risk=%d", d.ActionCostMinorUnits, d.RiskCostMinorUnits)
+	}
+	if d.ExpectedGrossRecoveryMinorUnits <= 0 {
+		t.Fatal("the Economic Engine's ex-ante prediction must still be recorded even when the action can't execute")
+	}
+}
+
+// TestRevGuardStrategy_EscalatesLowConfidence isolates the confidence
+// rule (customer_abandonment -> send_reminder, confidence 0.55, which is
+// itself an auto-allowed action) from the action-not-allowed rule
+// exercised above, per the M9 stress scenario "low AI confidence".
+func TestRevGuardStrategy_EscalatesLowConfidence(t *testing.T) {
+	s := NewRevGuardStrategy()
+	opp := SyntheticOpportunity{
+		AmountMinorUnits:        10_000,
+		Currency:                "INR",
+		FailureCategory:         domain.FailureCategoryCustomerAbandonment,
+		PreviousAttempts:        1,
+		PreviousRecoveryActions: 0,
+	}
+	d := mustDecide(t, s, opp)
+	if d.Outcome != domain.PolicyDecisionOutcomeEscalate {
+		t.Fatalf("expected ESCALATE for a low-confidence (0.55) recommendation, got %s", d.Outcome)
+	}
+	// Action is only populated on ALLOW (see StrategyDecision's doc
+	// comment) — an ESCALATE decision authorizes nothing.
+	if d.Executed {
+		t.Fatal("an ESCALATE decision must never be Executed")
+	}
+}
+
+func TestRevGuardStrategy_RetryPaymentIsExecuted(t *testing.T) {
+	s := NewRevGuardStrategy()
+	opp := SyntheticOpportunity{
+		AmountMinorUnits:        50_000,
+		Currency:                "INR",
+		FailureCategory:         domain.FailureCategoryTransientFailure,
+		PreviousAttempts:        1,
+		PreviousRecoveryActions: 0,
+	}
+	d := mustDecide(t, s, opp)
+
+	if d.Outcome != domain.PolicyDecisionOutcomeAllow {
+		t.Fatalf("expected ALLOW, got %s", d.Outcome)
+	}
+	if d.Action != domain.RecommendedActionRetryPayment {
+		t.Fatalf("expected retry_payment, got %s", d.Action)
+	}
+	if !d.Executed {
+		t.Fatal("retry_payment is the one action Milestone 6 actually implements and must be Executed")
+	}
+	if d.ActionCostMinorUnits <= 0 {
+		t.Fatal("an executed action must carry a positive cost")
 	}
 }

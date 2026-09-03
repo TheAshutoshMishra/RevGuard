@@ -94,19 +94,66 @@ type razorpayPaymentLinkResponse struct {
 }
 
 func (p *RazorpayProvider) RetryPayment(ctx context.Context, request RetryPaymentRequest) (RetryPaymentResult, error) {
+	result, err := p.createPaymentLink(ctx, request.AmountMinorUnits, request.Currency, request.IdempotencyKey,
+		"RevGuard recovery retry for payment "+request.ExternalPaymentID)
+	if err != nil {
+		return RetryPaymentResult{}, err
+	}
+	return RetryPaymentResult{
+		Succeeded: result.succeeded, ProviderReference: result.providerReference,
+		ErrorCode: result.errorCode, ErrorMessage: result.errorMessage,
+	}, nil
+}
+
+// SendPaymentLink (Milestone 10) calls the identical Razorpay Payment
+// Links operation as RetryPayment — Razorpay's API surface offers no
+// different mechanism for "proactively send a payment link" versus
+// "retry via a payment link," so the only real difference is the
+// description text recorded on the link and the domain.RecoveryActionType
+// ExecutionEngine attaches to the resulting RecoveryAction. See
+// RetryPayment's doc comment above ("WHAT 'RETRY' MEANS HERE") for the
+// shared rationale and verification status, which applies identically
+// here.
+func (p *RazorpayProvider) SendPaymentLink(ctx context.Context, request SendPaymentLinkRequest) (SendPaymentLinkResult, error) {
+	result, err := p.createPaymentLink(ctx, request.AmountMinorUnits, request.Currency, request.IdempotencyKey,
+		"RevGuard payment link for payment "+request.ExternalPaymentID)
+	if err != nil {
+		return SendPaymentLinkResult{}, err
+	}
+	return SendPaymentLinkResult{
+		Succeeded: result.succeeded, ProviderReference: result.providerReference,
+		ErrorCode: result.errorCode, ErrorMessage: result.errorMessage,
+	}, nil
+}
+
+// razorpayLinkResult is the shared, provider-shape-agnostic outcome of
+// createPaymentLink; RetryPayment and SendPaymentLink each translate it
+// into their own public result type.
+type razorpayLinkResult struct {
+	succeeded         bool
+	providerReference string
+	errorCode         string
+	errorMessage      string
+}
+
+// createPaymentLink is the one place that actually calls Razorpay's
+// POST /v1/payment_links — both RetryPayment and SendPaymentLink use it,
+// so the HTTP/error-classification logic is never duplicated between the
+// two actions that happen to share a gateway operation.
+func (p *RazorpayProvider) createPaymentLink(ctx context.Context, amountMinorUnits int64, currency, idempotencyKey, description string) (razorpayLinkResult, error) {
 	body, err := json.Marshal(razorpayPaymentLinkRequest{
-		Amount:      request.AmountMinorUnits,
-		Currency:    request.Currency,
-		Description: "RevGuard recovery retry for payment " + request.ExternalPaymentID,
-		ReferenceID: request.IdempotencyKey,
+		Amount:      amountMinorUnits,
+		Currency:    currency,
+		Description: description,
+		ReferenceID: idempotencyKey,
 	})
 	if err != nil {
-		return RetryPaymentResult{}, fmt.Errorf("service: marshal razorpay request: %w", err)
+		return razorpayLinkResult{}, fmt.Errorf("service: marshal razorpay request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/payment_links", bytes.NewReader(body))
 	if err != nil {
-		return RetryPaymentResult{}, fmt.Errorf("service: build razorpay request: %w", err)
+		return razorpayLinkResult{}, fmt.Errorf("service: build razorpay request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// HTTP Basic Auth per Razorpay's standard convention — credentials go
@@ -121,26 +168,26 @@ func (p *RazorpayProvider) RetryPayment(ctx context.Context, request RetryPaymen
 		// definition. Never wrap the raw error string if it might embed
 		// request details beyond the URL; http.Client errors are safe
 		// here since credentials are header-based, not URL-based.
-		return RetryPaymentResult{}, fmt.Errorf("service: razorpay request failed: %w", err)
+		return razorpayLinkResult{}, fmt.Errorf("service: razorpay request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	const maxBody = 1 << 20
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
-		return RetryPaymentResult{}, fmt.Errorf("service: read razorpay response: %w", err)
+		return razorpayLinkResult{}, fmt.Errorf("service: read razorpay response: %w", err)
 	}
 
 	var parsed razorpayPaymentLinkResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		// A response was received but isn't the shape we expect —
 		// ambiguous: we can't tell if the operation happened.
-		return RetryPaymentResult{}, fmt.Errorf("service: razorpay response was not the expected shape: %w", err)
+		return razorpayLinkResult{}, fmt.Errorf("service: razorpay response was not the expected shape: %w", err)
 	}
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		return RetryPaymentResult{Succeeded: true, ProviderReference: parsed.ID}, nil
+		return razorpayLinkResult{succeeded: true, providerReference: parsed.ID}, nil
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		// A 4xx means Razorpay received and definitively rejected the
 		// request — a clear, actionable answer, not ambiguous.
@@ -152,10 +199,10 @@ func (p *RazorpayProvider) RetryPayment(ctx context.Context, request RetryPaymen
 			}
 			errorMessage = "razorpay: " + parsed.Error.Description
 		}
-		return RetryPaymentResult{Succeeded: false, ErrorCode: errorCode, ErrorMessage: errorMessage}, nil
+		return razorpayLinkResult{succeeded: false, errorCode: errorCode, errorMessage: errorMessage}, nil
 	default:
 		// 5xx or anything else unexpected: the server may or may not
 		// have processed the request before erroring — ambiguous.
-		return RetryPaymentResult{}, fmt.Errorf("service: razorpay returned HTTP %d", resp.StatusCode)
+		return razorpayLinkResult{}, fmt.Errorf("service: razorpay returned HTTP %d", resp.StatusCode)
 	}
 }

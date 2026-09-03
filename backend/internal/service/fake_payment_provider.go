@@ -44,8 +44,11 @@ var (
 // can never be mistaken for a real execution.
 //
 // InvocationCount is safe for concurrent use (atomic), letting
-// concurrency/idempotency tests assert exactly how many times
-// RetryPayment actually ran.
+// concurrency/idempotency tests assert exactly how many times a provider
+// method actually ran. It counts calls to either RetryPayment or
+// SendPaymentLink — tests that care about one specifically construct a
+// fresh FakeProvider per action type, the same way existing
+// ExecutionEngine tests already do per scenario.
 type FakeProvider struct {
 	scenario    FakeProviderScenario
 	invocations int64
@@ -88,5 +91,40 @@ func (p *FakeProvider) RetryPayment(_ context.Context, request RetryPaymentReque
 		return RetryPaymentResult{}, ErrFakeProviderTransportError
 	default:
 		return RetryPaymentResult{}, fmt.Errorf("fake provider: unknown scenario %q", p.scenario)
+	}
+}
+
+// SendPaymentLink applies the exact same five deterministic scenarios as
+// RetryPayment (Milestone 10) — the fake provider makes no distinction
+// between action types, since its purpose is exercising ExecutionEngine's
+// and RevGuard's own logic, not modeling any real gateway's specific
+// payment-link behavior.
+func (p *FakeProvider) SendPaymentLink(_ context.Context, request SendPaymentLinkRequest) (SendPaymentLinkResult, error) {
+	atomic.AddInt64(&p.invocations, 1)
+
+	switch p.scenario {
+	case FakeProviderScenarioSuccess:
+		return SendPaymentLinkResult{
+			Succeeded:         true,
+			ProviderReference: "fake_link_" + request.IdempotencyKey,
+		}, nil
+	case FakeProviderScenarioDefinitiveFailure:
+		return SendPaymentLinkResult{
+			Succeeded:    false,
+			ErrorCode:    "CARD_DECLINED",
+			ErrorMessage: "fake provider: card declined",
+		}, nil
+	case FakeProviderScenarioUnsupported:
+		return SendPaymentLinkResult{
+			Succeeded:    false,
+			ErrorCode:    "UNSUPPORTED_OPERATION",
+			ErrorMessage: "fake provider: payment link not supported for this payment",
+		}, nil
+	case FakeProviderScenarioTimeout:
+		return SendPaymentLinkResult{}, ErrFakeProviderTimeout
+	case FakeProviderScenarioTransportError:
+		return SendPaymentLinkResult{}, ErrFakeProviderTransportError
+	default:
+		return SendPaymentLinkResult{}, fmt.Errorf("fake provider: unknown scenario %q", p.scenario)
 	}
 }

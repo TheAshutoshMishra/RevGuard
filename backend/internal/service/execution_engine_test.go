@@ -66,10 +66,11 @@ func seedEscalateDecision(t *testing.T, pool *pgxpool.Pool) (*domain.RecoveryCas
 	return outcome.Case, outcome.Decision
 }
 
-// seedAllowDecisionForAction produces a genuine ALLOW decision whose
-// AuthorizedAction is send_payment_link (auto-allowed by DefaultPolicyConfig)
-// rather than retry_payment — used to test the "action not executable"
-// rejection, since ExecutionEngine only implements retry_payment.
+// seedAllowDecisionForSendPaymentLink produces a genuine ALLOW decision
+// whose AuthorizedAction is send_payment_link (auto-allowed by
+// DefaultPolicyConfig) rather than retry_payment — used to exercise
+// ExecutionEngine's send_payment_link execution path (Milestone 10),
+// which uses PaymentProvider.SendPaymentLink instead of RetryPayment.
 func seedAllowDecisionForSendPaymentLink(t *testing.T, pool *pgxpool.Pool) (*domain.RecoveryCase, *domain.PolicyDecision) {
 	t.Helper()
 	recoveryCase, diagnosis, evaluation := seedFullCase(t, pool,
@@ -85,6 +86,31 @@ func seedAllowDecisionForSendPaymentLink(t *testing.T, pool *pgxpool.Pool) (*dom
 	}
 	if outcome.Decision.AuthorizedAction != domain.RecommendedActionSendPaymentLink {
 		t.Fatalf("expected AuthorizedAction=send_payment_link, got %q", outcome.Decision.AuthorizedAction)
+	}
+	return outcome.Case, outcome.Decision
+}
+
+// seedAllowDecisionForUnsupportedAction produces a genuine ALLOW decision
+// whose AuthorizedAction is send_reminder — auto-allowed by
+// DefaultPolicyConfig, but (unlike retry_payment and send_payment_link)
+// still has no entry in executableActions. Used to test the "action not
+// executable" rejection now that send_payment_link has become executable
+// (Milestone 10).
+func seedAllowDecisionForUnsupportedAction(t *testing.T, pool *pgxpool.Pool) (*domain.RecoveryCase, *domain.PolicyDecision) {
+	t.Helper()
+	recoveryCase, diagnosis, evaluation := seedFullCase(t, pool,
+		domain.FailureCategoryCustomerAbandonment, domain.RecommendedActionSendReminder, 0.90, 10_000, 5_000)
+
+	engine := newPolicyEngine(pool)
+	outcome, err := engine.Evaluate(context.Background(), recoveryCase.ID, diagnosis.ID, evaluation.ID)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if outcome.Decision.Outcome != domain.PolicyDecisionOutcomeAllow {
+		t.Fatalf("expected ALLOW, got %s (reasons=%v)", outcome.Decision.Outcome, outcome.Decision.ReasonCodes)
+	}
+	if outcome.Decision.AuthorizedAction != domain.RecommendedActionSendReminder {
+		t.Fatalf("expected AuthorizedAction=send_reminder, got %q", outcome.Decision.AuthorizedAction)
 	}
 	return outcome.Case, outcome.Decision
 }
@@ -351,7 +377,7 @@ func TestExecutionEngine_AllowWithoutAuthorizedAction(t *testing.T) {
 
 func TestExecutionEngine_UnsupportedActionNoProviderCall(t *testing.T) {
 	pool := testPool(t)
-	recoveryCase, decision := seedAllowDecisionForSendPaymentLink(t, pool)
+	recoveryCase, decision := seedAllowDecisionForUnsupportedAction(t, pool)
 	provider := service.NewFakeProvider(service.FakeProviderScenarioSuccess)
 	engine := newExecutionEngine(pool, provider)
 
@@ -363,6 +389,193 @@ func TestExecutionEngine_UnsupportedActionNoProviderCall(t *testing.T) {
 		t.Fatal("expected zero provider invocations for an unsupported action")
 	}
 	assertRecoveryActionCount(t, pool, recoveryCase.ID, 0)
+}
+
+// ---------------------------------------------------------------------
+// send_payment_link execution (Milestone 10).
+//
+// These mirror the retry_payment tests above field-for-field, proving
+// send_payment_link goes through the identical ALLOW -> EXECUTING ->
+// VERIFYING pipeline, idempotency, concurrency safety, and audit
+// trail — never a parallel, weaker code path.
+// ---------------------------------------------------------------------
+
+func TestExecutionEngine_SendPaymentLink_AllowExecutesSuccessfully(t *testing.T) {
+	pool := testPool(t)
+	recoveryCase, decision := seedAllowDecisionForSendPaymentLink(t, pool)
+	provider := service.NewFakeProvider(service.FakeProviderScenarioSuccess)
+	engine := newExecutionEngine(pool, provider)
+
+	outcome, err := engine.Execute(context.Background(), recoveryCase.ID, decision.ID)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !outcome.Created {
+		t.Fatal("expected Created=true")
+	}
+	if outcome.Action.ActionType != domain.RecoveryActionTypeSendPaymentLink {
+		t.Fatalf("expected send_payment_link action type, got %s", outcome.Action.ActionType)
+	}
+	if outcome.Action.Status != domain.RecoveryActionStatusSucceeded {
+		t.Fatalf("expected SUCCEEDED (link created), got %s", outcome.Action.Status)
+	}
+	if outcome.Action.ProviderReference == "" {
+		t.Fatal("expected a provider reference on success")
+	}
+	// The critical invariant this milestone introduces: creating a
+	// payment link is never financial success. The case must land in
+	// VERIFYING, never SUCCESS, regardless of how the link creation
+	// itself went.
+	if outcome.Case.Status != domain.RecoveryCaseStatusVerifying {
+		t.Fatalf("expected case status VERIFYING (not SUCCESS) after link creation, got %s", outcome.Case.Status)
+	}
+	if provider.InvocationCount() != 1 {
+		t.Fatalf("expected exactly 1 provider invocation, got %d", provider.InvocationCount())
+	}
+
+	persistedCase, err := repository.NewPostgresRecoveryCaseRepository(pool).GetByID(context.Background(), recoveryCase.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if persistedCase.Status != domain.RecoveryCaseStatusVerifying {
+		t.Fatalf("persisted case status: got %s, want VERIFYING", persistedCase.Status)
+	}
+	assertRecoveryActionCount(t, pool, recoveryCase.ID, 1)
+
+	startedCount := countRows(t, pool,
+		`SELECT count(*) FROM audit_events WHERE recovery_case_id = $1 AND event_type = 'recovery_execution.started'`, recoveryCase.ID)
+	if startedCount != 1 {
+		t.Fatalf("expected 1 recovery_execution.started audit row, got %d", startedCount)
+	}
+	completedCount := countRows(t, pool,
+		`SELECT count(*) FROM audit_events WHERE recovery_case_id = $1 AND event_type = 'recovery_execution.completed'`, recoveryCase.ID)
+	if completedCount != 1 {
+		t.Fatalf("expected 1 recovery_execution.completed audit row, got %d", completedCount)
+	}
+}
+
+func TestExecutionEngine_SendPaymentLink_DefinitiveFailure(t *testing.T) {
+	pool := testPool(t)
+	recoveryCase, decision := seedAllowDecisionForSendPaymentLink(t, pool)
+	provider := service.NewFakeProvider(service.FakeProviderScenarioDefinitiveFailure)
+	engine := newExecutionEngine(pool, provider)
+
+	outcome, err := engine.Execute(context.Background(), recoveryCase.ID, decision.ID)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if outcome.Action.Status != domain.RecoveryActionStatusFailed {
+		t.Fatalf("expected FAILED, got %s", outcome.Action.Status)
+	}
+	if outcome.Action.ErrorCode == "" {
+		t.Fatal("expected a non-empty error code")
+	}
+	if outcome.Case.Status != domain.RecoveryCaseStatusVerifying {
+		t.Fatalf("expected case status VERIFYING even on link-creation failure, got %s", outcome.Case.Status)
+	}
+}
+
+func TestExecutionEngine_SendPaymentLink_TimeoutBecomesUnknown(t *testing.T) {
+	pool := testPool(t)
+	recoveryCase, decision := seedAllowDecisionForSendPaymentLink(t, pool)
+	provider := service.NewFakeProvider(service.FakeProviderScenarioTimeout)
+	engine := newExecutionEngine(pool, provider)
+
+	outcome, err := engine.Execute(context.Background(), recoveryCase.ID, decision.ID)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if outcome.Action.Status != domain.RecoveryActionStatusUnknown {
+		t.Fatalf("expected UNKNOWN, got %s", outcome.Action.Status)
+	}
+	if outcome.Case.Status == domain.RecoveryCaseStatusSuccess || outcome.Case.Status == domain.RecoveryCaseStatusFailed {
+		t.Fatal("an ambiguous provider outcome must never be reported as SUCCESS or FAILED")
+	}
+}
+
+func TestExecutionEngine_SendPaymentLink_TransportErrorBecomesUnknown(t *testing.T) {
+	pool := testPool(t)
+	recoveryCase, decision := seedAllowDecisionForSendPaymentLink(t, pool)
+	provider := service.NewFakeProvider(service.FakeProviderScenarioTransportError)
+	engine := newExecutionEngine(pool, provider)
+
+	outcome, err := engine.Execute(context.Background(), recoveryCase.ID, decision.ID)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if outcome.Action.Status != domain.RecoveryActionStatusUnknown {
+		t.Fatalf("expected UNKNOWN, got %s", outcome.Action.Status)
+	}
+}
+
+func TestExecutionEngine_SendPaymentLink_DuplicateExecutionRequestIsIdempotent(t *testing.T) {
+	pool := testPool(t)
+	recoveryCase, decision := seedAllowDecisionForSendPaymentLink(t, pool)
+	provider := service.NewFakeProvider(service.FakeProviderScenarioSuccess)
+	engine := newExecutionEngine(pool, provider)
+
+	first, err := engine.Execute(context.Background(), recoveryCase.ID, decision.ID)
+	if err != nil {
+		t.Fatalf("first Execute: %v", err)
+	}
+	if !first.Created {
+		t.Fatal("expected first call to be a fresh execution")
+	}
+
+	second, err := engine.Execute(context.Background(), recoveryCase.ID, decision.ID)
+	if err != nil {
+		t.Fatalf("second Execute: %v", err)
+	}
+	if second.Created {
+		t.Fatal("expected second call to be an idempotent no-op")
+	}
+	if second.Action.ID != first.Action.ID {
+		t.Fatal("expected the same RecoveryAction ID on retry")
+	}
+	if provider.InvocationCount() != 1 {
+		t.Fatalf("expected exactly 1 provider invocation across both calls, got %d", provider.InvocationCount())
+	}
+	assertRecoveryActionCount(t, pool, recoveryCase.ID, 1)
+}
+
+func TestExecutionEngine_SendPaymentLink_ConcurrentExecutionDoesNotDuplicate(t *testing.T) {
+	pool := testPool(t)
+	recoveryCase, decision := seedAllowDecisionForSendPaymentLink(t, pool)
+	provider := service.NewFakeProvider(service.FakeProviderScenarioSuccess)
+	engine := newExecutionEngine(pool, provider)
+
+	const workers = 5
+	outcomes := make([]*service.ExecutionOutcome, workers)
+	errs := make([]error, workers)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			outcomes[i], errs[i] = engine.Execute(context.Background(), recoveryCase.ID, decision.ID)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("worker %d: Execute returned error: %v", i, err)
+		}
+	}
+
+	if provider.InvocationCount() != 1 {
+		t.Fatalf("expected exactly 1 provider invocation across %d concurrent callers, got %d", workers, provider.InvocationCount())
+	}
+	assertRecoveryActionCount(t, pool, recoveryCase.ID, 1)
+
+	persistedCase, err := repository.NewPostgresRecoveryCaseRepository(pool).GetByID(context.Background(), recoveryCase.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if persistedCase.Status != domain.RecoveryCaseStatusVerifying {
+		t.Fatalf("expected final case status VERIFYING, got %s", persistedCase.Status)
+	}
 }
 
 func TestExecutionEngine_DuplicateExecutionRequestIsIdempotent(t *testing.T) {

@@ -26,6 +26,14 @@ type Config struct {
 	AIServiceURL     string
 	AIRequestTimeout time.Duration
 
+	// PolicyProfile selects which named service.PolicyConfig
+	// (conservative/balanced/aggressive — see service.PolicyProfiles,
+	// Milestone 10) PolicyEngine evaluates against. Defaults to
+	// "balanced", which is numerically identical to the original
+	// Milestone 5 DefaultPolicyConfig — an unset POLICY_PROFILE changes
+	// nothing about existing production behavior.
+	PolicyProfile string
+
 	// PaymentProvider selects the ExecutionEngine's PaymentProvider
 	// implementation: "fake" (default, safe for local/dev/demo — no
 	// external network calls) or "razorpay" (requires RazorpayKeyID and
@@ -69,6 +77,8 @@ func Load() Config {
 
 		AIServiceURL:     getEnv("AI_SERVICE_URL", "http://localhost:8000"),
 		AIRequestTimeout: getEnvSeconds("AI_REQUEST_TIMEOUT_SECONDS", 20),
+
+		PolicyProfile: getEnv("POLICY_PROFILE", "balanced"),
 
 		PaymentProvider:   getEnv("PAYMENT_PROVIDER", "fake"),
 		RazorpayKeyID:     getEnv("RAZORPAY_KEY_ID", ""),

@@ -1,4 +1,4 @@
-# Evaluation & Revenue Recovery Proof — Milestone 8
+# Evaluation & Revenue Recovery Proof — Milestones 8–9
 
 This document describes RevGuard's offline, deterministic evaluation
 harness: the system that answers, with a computed number rather than a
@@ -7,7 +7,7 @@ recovery strategy, while taking fewer unnecessary or risky actions?"**
 
 **Everything in this document and every number this system produces is
 SYNTHETIC.** No real Razorpay, merchant, or customer data is used
-anywhere in Milestone 8, and no result computed here has been validated
+anywhere in this evaluation, and no result computed here has been validated
 against live production data. See "Why this is not production benchmark
 data" at the end of this document.
 
@@ -38,6 +38,60 @@ actions may still be economically preferable once cost and risk are
 counted — that tradeoff is exactly what this evaluation is built to
 surface, not to hide.
 
+## Milestone 9 refinements
+
+Milestone 9 kept Milestone 8's architecture, dataset generator, and
+baselines unchanged and closed two real production-fidelity gaps in how
+RevGuard's simulated strategy translated a policy decision into a
+financial outcome:
+
+1. **Execution-capability gating.** Milestone 6's `ExecutionEngine` only
+   ever implemented `retry_payment` — every other authorized action is
+   rejected with `ErrActionNotExecutable` before any side effect (see
+   `docs/architecture/execution-engine.md`). Milestone 8's simulation did
+   not model this: any policy `ALLOW` was treated as if it executed.
+   Milestone 9 added `isRevGuardActionExecutable` (mirroring
+   `ExecutionEngine.phase1`'s exact check) so that an `ALLOW` for, say,
+   `send_payment_link` is recorded as genuinely authorized
+   (`StrategyDecision.Outcome == ALLOW`) but not executed
+   (`StrategyDecision.Executed == false`, zero cost, zero possible
+   recovery) — tallied under the new `UnsupportedActions` metric. This
+   applies only to `RevGuardStrategy`; the baselines don't route through
+   RevGuard's `ExecutionEngine` and are not bound by its current
+   implementation coverage (see `StrategyDecision.Executed`'s doc
+   comment in `evaluation_strategies.go`).
+2. **Ambiguous/UNKNOWN financial outcomes.** Milestone 8's ground truth
+   was strictly binary (recoverable or not). Real Milestone 6/7 behavior
+   includes a third, genuinely different outcome: an executed action
+   whose financial truth never resolves (a provider timeout at execution
+   time, or an unresolved reconciliation lookup) — recorded as `UNKNOWN`
+   and never guessed into `SUCCESS`/`FAILED`. Milestone 9 added
+   `groundTruthResult.ObservationAmbiguous` (an independent, deterministic
+   per-opportunity draw, illustrative 4% rate) and
+   `resolveFinancialOutcome`, which reuses `domain.RecoveryOutcomeStatus`'s
+   exact `SUCCESS`/`FAILED`/`UNKNOWN` vocabulary (Milestone 1/7) rather
+   than inventing a parallel one. An `UNKNOWN` outcome is tallied under
+   the new `AmbiguousOutcomes` metric — never counted as recovered, and
+   never counted as `UnnecessaryActions` (unresolved is not the same as
+   definitively wasted).
+
+Two new metrics were added as a direct consequence:
+`ExpectedRecoveryValueMinorUnits` (RevGuard's Economic Engine's ex-ante
+prediction, recorded whenever policy `ALLOW`s — even an unsupported
+action — so it can be compared against what was actually, definitively
+recovered) and `IncrementalRecoveryRate` (`revguard.RecoveryRate -
+baseline.RecoveryRate`, a ratio-of-ratios distinct from the absolute
+`IncrementalRecoveredRevenueMinorUnits`). See "Metrics and exact
+formulas" below for the full, current list.
+
+Because both changes make RevGuard's simulated recovery *more*
+conservative (a real action can now correctly recover nothing when it
+isn't actually executable or when its outcome never resolves), Milestone
+9's numbers for RevGuard are lower than Milestone 8's for the same seed —
+this is the direct, intended effect of aligning the simulation with
+production reality more closely, not a regression. See CLAUDE.md's
+Milestone 9 section for the exact before/after figures.
+
 ## Architecture
 
 ```
@@ -59,18 +113,19 @@ FixedRetryStrategy  StaticRulesStrategy  RevGuardStrategy
                                           pipeline components)
   |                 |                 |
   v                 v                 v
-StrategyDecision{Outcome: ALLOW|BLOCK|ESCALATE, Action, costs}
+StrategyDecision{Outcome: ALLOW|BLOCK|ESCALATE, Executed, Action, costs}
   |                 |                 |
   +--------+--------+--------+--------+
            v
   apply the SAME groundTruthResult (computed before any strategy ran)
-  -> recoveredAmount(opp, truth, decision)
+  -> resolveFinancialOutcome(truth) for every Executed decision
+     (SUCCESS | FAILED | UNKNOWN)
            v
   aggregateStrategyMetrics(...)   [evaluation_metrics.go]
            v
   RunEvaluation(...) -> EvaluationResult   [evaluation_engine.go]
            v
-  JSON (machine-readable) + FormatResultTable (human-readable)
+  JSON + FormatResultTable + FormatMarkdownReport (human-readable)
 ```
 
 Every box above lives in `backend/internal/service/evaluation_*.go`.
@@ -195,8 +250,17 @@ vocabulary (Milestone 5) — the same three outcomes the real
 `PolicyEngine` produces. RevGuard never gets to alter the ground truth,
 never sees the baselines' decisions, and never sees its own outcome
 before the ground truth is applied — the exact same
-`recoveredAmount(opp, truth, decision)` function
-(`evaluation_metrics.go`) is used for all three strategies.
+`resolveFinancialOutcome(truth)` function (`evaluation_metrics.go`) is
+used for every strategy's executed decisions.
+
+5. `isRevGuardActionExecutable` — **Milestone 9, new.** Mirrors
+   `ExecutionEngine.phase1`'s exact check
+   (`decision.AuthorizedAction != domain.RecommendedActionRetryPayment`
+   -> `ErrActionNotExecutable`). An `ALLOW` for `retry_payment` sets
+   `StrategyDecision.Executed = true` with real cost/risk; an `ALLOW`
+   for anything else stays authorized (`Outcome == ALLOW`, `Action` set)
+   but `Executed = false`, zero cost, zero possible recovery — see
+   "Milestone 9 refinements" above.
 
 **Why not the real `AnalysisOrchestrator`/`EconomicEngine`/
 `PolicyEngine`/`ExecutionEngine`?** Those engines are correct and
@@ -215,37 +279,51 @@ For every opportunity, `RunEvaluation` (`evaluation_engine.go`):
 
 1. Calls `Decide(opportunity)` on all three strategies — the same
    opportunity value, unchanged.
-2. Applies the same precomputed `groundTruthResult` to each strategy's
-   decision via `recoveredAmount`.
-3. Aggregates: recovered revenue, cost, risk cost, actions
-   taken/blocked/escalated, unnecessary actions, average attempts
+2. For every `ALLOW` decision, resolves the executed/unsupported split
+   (`decision.Executed`) and, for executed decisions, applies the same
+   precomputed `groundTruthResult` via `resolveFinancialOutcome`
+   (SUCCESS / FAILED / UNKNOWN).
+3. Aggregates: recovered revenue, cost, risk cost, expected recovery
+   value, actions taken/blocked/escalated/unsupported, ambiguous
+   outcomes, unnecessary actions, average attempts
    (`aggregateStrategyMetrics`).
 4. Compares RevGuard against each baseline.
 
 ## Metrics and exact formulas
 
 All monetary figures are `int64` minor units. `RecoveryRate`,
-`AverageAttempts`, and `ActionReductionPercent` are display ratios, not
-money, and are the only `float64` fields — the same convention
-`domain.RecoveryDiagnosis.Confidence` already established.
+`AverageAttempts`, `ActionReductionPercent`, and `IncrementalRecoveryRate`
+are display ratios, not money, and are the only `float64` fields — the
+same convention `domain.RecoveryDiagnosis.Confidence` already
+established.
 
 | Metric | Formula |
 |---|---|
 | Revenue At Risk | `sum(opportunity.AmountMinorUnits)` over the whole dataset |
 | Potentially Recoverable Revenue | `sum(opportunity.AmountMinorUnits)` where `groundTruth.Recoverable == true` |
-| Revenue Recovered | `sum(opportunity.AmountMinorUnits)` where `decision.Outcome == ALLOW AND groundTruth.Recoverable == true` |
+| Revenue Recovered | `sum(opportunity.AmountMinorUnits)` where `decision.Executed == true AND resolveFinancialOutcome(truth) == SUCCESS` |
 | Recovery Rate | `RevenueRecovered / RevenueAtRisk` (0 if RevenueAtRisk is 0) |
 | Incremental Recovered Revenue | `revguard.RevenueRecovered - baseline.RevenueRecovered` |
-| Recovery Cost | `sum(decision.ActionCostMinorUnits)` |
-| Risk Cost | `sum(decision.RiskCostMinorUnits)` |
+| Recovery Cost | `sum(decision.ActionCostMinorUnits)` (0 unless Executed) |
+| Risk Cost | `sum(decision.RiskCostMinorUnits)` (0 unless Executed) |
+| Expected Recovery Value | `sum(decision.ExpectedGrossRecoveryMinorUnits)` over every `Outcome == ALLOW` (executed or not); always 0 for the baselines, which have no economic model |
 | Net Incremental Value | `RevenueRecovered - RecoveryCost - RiskCost` |
 | Incremental Net Value | `revguard.NetIncrementalValue - baseline.NetIncrementalValue` |
-| Actions Taken | count of `Outcome == ALLOW` |
+| Actions Taken | count of `Executed == true` |
 | Actions Blocked | count of `Outcome == BLOCK` |
 | Human Escalations | count of `Outcome == ESCALATE` |
-| Unnecessary Actions | count of `Outcome == ALLOW AND recovered == 0` |
-| Average Attempts | mean of `opportunity.PreviousAttempts` over opportunities where `Outcome == ALLOW` (0 if none) |
+| Unsupported Actions | count of `Outcome == ALLOW AND Executed == false` (Milestone 6's real retry_payment-only execution coverage) |
+| Ambiguous Outcomes | count of `Executed == true AND resolveFinancialOutcome(truth) == UNKNOWN` |
+| Unnecessary Actions | count of `Executed == true AND resolveFinancialOutcome(truth) == FAILED` |
+| Average Attempts | mean of `opportunity.PreviousAttempts` over opportunities where `Executed == true` (0 if none) |
 | Action Reduction % | `(baseline.ActionsTaken - revguard.ActionsTaken) / baseline.ActionsTaken * 100` (0 if baseline took no actions) |
+| Incremental Recovery Rate | `revguard.RecoveryRate - baseline.RecoveryRate` |
+
+Every opportunity falls into exactly one of Actions Blocked / Human
+Escalations / Unsupported Actions / (executed: SUCCESS, contributing to
+Revenue Recovered) / Unnecessary Actions (FAILED) / Ambiguous Outcomes
+(UNKNOWN) — never more than one, so nothing is double-counted (see
+`TestAggregateStrategyMetrics_NoDoubleCounting`).
 
 These formulas are not redefined anywhere else in the code; the table
 above is the single source of truth for them.
@@ -263,15 +341,24 @@ does not (and should not) simulate one.
 ```
 go run ./cmd/evaluate --seed 12345 --cases 1000
 go run ./cmd/evaluate --seed 12345 --cases 1000 --output evaluation.json
+go run ./cmd/evaluate --seed 12345 --cases 1000 \
+  --output evaluation.json --markdown-output evaluation.md \
+  --commit $(git rev-parse --short HEAD)
 ```
 
 Running the same command twice with the same `--seed`/`--cases`
 produces byte-identical JSON — verified both by
 `TestRunEvaluation_Reproducible` (which additionally does a `reflect.DeepEqual`
 of the full result, not just the JSON) and by a manual run of the CLI
-twice with a file diff (see the CLAUDE.md Milestone 8 verification
+twice with a file diff (see the CLAUDE.md Milestone 9 verification
 section). No wall-clock timestamp, random UUID, or other non-deterministic
-value appears anywhere in `EvaluationResult`.
+value appears anywhere in `EvaluationResult`. `--commit` and the Markdown
+report's "Generated at" timestamp are supplied by the caller and rendered
+only by `FormatMarkdownReport` — a presentational function that reads
+`EvaluationResult` but is not part of it, so the JSON stays reproducible
+even though the Markdown report's metadata line legitimately differs run
+to run (verified by diffing the JSON, not the Markdown, across two runs
+with different `--commit` values).
 
 ## Fairness / anti-bias guarantees
 
@@ -319,12 +406,21 @@ value appears anywhere in `EvaluationResult`.
   estimator (see `docs/decisions/0001-economic-engine-probability-vs-confidence.md`).
 - **`ExecutionEngine`/`WebhookProcessor`/`ReconciliationEngine` are not
   invoked.** The simulation models "was money actually recovered" via
-  the ground-truth model directly, standing in for what M6 execution +
-  M7 financial truth would determine for a real action. This is a
+  the ground-truth model plus `resolveFinancialOutcome` and
+  `isRevGuardActionExecutable`, standing in for what M6 execution + M7
+  financial truth would determine for a real action — as of Milestone 9
+  this stand-in faithfully respects M6's real retry_payment-only
+  execution coverage and models M7's UNKNOWN outcome as a distinct,
+  never-guessed case, but it still does not exercise the real
+  execution/webhook/reconciliation *code paths themselves*, which are
+  already covered by their own Milestone 6/7 test suites. This remains a
   deliberate simplification for a fast, dependency-free, in-process
-  evaluation — it does not exercise the real execution/webhook code
-  paths, which are already covered by their own Milestone 6/7 test
-  suites.
+  evaluation, not a claim that the real engines were run.
+- **The ambiguous-outcome rate (4%) is illustrative, not measured.**
+  Milestone 7 has no automatic background reconciliation, so a nonzero
+  rate of permanently-unresolved outcomes is a real property of the
+  current system, but the specific 4% figure is an assumption, not a
+  measured Razorpay reliability statistic.
 - **ESCALATE never recovers revenue in this simulation** (see above) —
   a conservative simplification, not a claim that human escalation is
   worthless.
