@@ -143,6 +143,27 @@ func (e *PolicyEngine) Evaluate(ctx context.Context, recoveryCaseID, recoveryDia
 	}
 
 	if recoveryCase.Status != domain.RecoveryCaseStatusAnalyzed {
+		// Under READ COMMITTED, each SELECT in this transaction sees a
+		// fresh snapshot, not one consistent snapshot for the whole
+		// transaction — so a concurrent evaluation of this exact tuple
+		// can commit (decision + case transition) in the gap between our
+		// idempotency check above and this status check. Before treating
+		// that as a genuine wrong-state error, re-check idempotency once
+		// more: if a concurrent call really did just finish, its
+		// decision is now visible (it's already committed, which is
+		// exactly why we're observing its case-status side effect), and
+		// this is a safe retry, not an error.
+		if existing, err := decisionRepo.GetByCaseDiagnosisEvaluationVersion(ctx, recoveryCaseID, recoveryDiagnosisID, recoveryEconomicEvaluationID, e.config.Version); err == nil {
+			if commitErr := tx.Commit(ctx); commitErr != nil {
+				return nil, fmt.Errorf("service: commit: %w", commitErr)
+			}
+			e.logger.Info("policy decision completed concurrently; no-op",
+				"recovery_case_id", recoveryCaseID, "recovery_diagnosis_id", recoveryDiagnosisID,
+				"recovery_economic_evaluation_id", recoveryEconomicEvaluationID, "decision_id", existing.ID)
+			return &PolicyEvaluationOutcome{Decision: existing, Case: recoveryCase, Created: false}, nil
+		} else if !errors.Is(err, repository.ErrNotFound) {
+			return nil, fmt.Errorf("service: re-check existing policy decision: %w", err)
+		}
 		return nil, fmt.Errorf("%w: case %s is %q", ErrRecoveryCaseNotAnalyzed, recoveryCaseID, recoveryCase.Status)
 	}
 

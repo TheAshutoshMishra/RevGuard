@@ -68,4 +68,34 @@ var (
 	// (e.g. already policy-evaluated with different inputs). Policy
 	// evaluation only ever starts fresh from ANALYZED.
 	ErrRecoveryCaseNotAnalyzed = errors.New("service: recovery case is not in ANALYZED status")
+
+	// ErrPolicyDecisionNotFound means a requested PolicyDecision does not
+	// exist.
+	ErrPolicyDecisionNotFound = errors.New("service: policy decision not found")
+
+	// ErrPolicyDecisionCaseMismatch means a PolicyDecision was found but
+	// belongs to a different RecoveryCase than the one requested.
+	ErrPolicyDecisionCaseMismatch = errors.New("service: policy decision does not belong to the specified recovery case")
+
+	// ErrPolicyDecisionNotAllow means execution was requested for a
+	// PolicyDecision whose Outcome is not ALLOW. Only ALLOW may execute —
+	// see docs/architecture/execution-engine.md.
+	ErrPolicyDecisionNotAllow = errors.New("service: policy decision is not ALLOW")
+
+	// ErrMissingAuthorizedAction means an ALLOW PolicyDecision has no
+	// AuthorizedAction set. This should be structurally impossible given
+	// PolicyEngine's invariants (Milestone 5), but ExecutionEngine checks
+	// it explicitly rather than trusting that invariant blindly.
+	ErrMissingAuthorizedAction = errors.New("service: policy decision has no authorized action")
+
+	// ErrActionNotExecutable means the AuthorizedAction is a recognized
+	// domain.RecommendedAction but has no real execution path implemented
+	// yet (Milestone 6 implements only retry_payment). The policy
+	// decision is still respected — nothing is executed, and this is
+	// reported as a clear, typed error rather than a fabricated result.
+	ErrActionNotExecutable = errors.New("service: authorized action has no execution implementation")
+
+	// ErrRecoveryCaseNotAllow means execution was requested for a
+	// RecoveryCase that is not currently ALLOW.
+	ErrRecoveryCaseNotAllow = errors.New("service: recovery case is not in ALLOW status")
 )
