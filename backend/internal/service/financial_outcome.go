@@ -22,8 +22,13 @@ type financialOutcomeInput struct {
 	RecoveryCaseID   uuid.UUID
 	RecoveryActionID uuid.UUID
 
-	// TargetCaseStatus is SUCCESS or FAILED — the only two values
-	// applyFinancialOutcome ever transitions a case to.
+	// TargetCaseStatus is SUCCESS, FAILED, or UNKNOWN — the only three
+	// values applyFinancialOutcome ever transitions a case to (mirroring
+	// the three outgoing edges VERIFYING has in the state machine).
+	// UNKNOWN means financial truth could not be established and is not
+	// expected to become establishable through further automation (e.g.
+	// no provider reference was ever recorded, or the provider reports no
+	// record of the reference at all) — see ReconciliationEngine.
 	TargetCaseStatus domain.RecoveryCaseStatus
 	// OutcomeStatus mirrors TargetCaseStatus but in
 	// domain.RecoveryOutcomeStatus's own vocabulary (kept distinct on
@@ -31,9 +36,11 @@ type financialOutcomeInput struct {
 	OutcomeStatus domain.RecoveryOutcomeStatus
 
 	// RecoveredAmount is the provider-confirmed captured amount for
-	// SUCCESS, or a zero-value Money for FAILED. Never the original
-	// payment amount, an economic estimate, or any RevGuard-internal
-	// figure — see docs/architecture/webhooks-reconciliation.md.
+	// SUCCESS, or a zero-value Money (still carrying a valid currency,
+	// e.g. the case's own RevenueAtRisk currency) for FAILED/UNKNOWN.
+	// Never the original payment amount, an economic estimate, or any
+	// RevGuard-internal figure — see
+	// docs/architecture/webhooks-reconciliation.md.
 	RecoveredAmount domain.Money
 
 	ExternalReference      string
@@ -226,4 +233,40 @@ func mapProviderEventToOutcome(status domain.ProviderEventStatus) (domain.Recove
 	default:
 		return "", "", "", fmt.Errorf("service: %q is not a definitive provider event status", status)
 	}
+}
+
+// computeRecoveredAmount builds the domain.Money applyFinancialOutcome
+// should persist for a given outcome status, shared identically by
+// WebhookProcessor and ReconciliationEngine. It is the one place that
+// enforces the financial outcome rule: a SUCCESS outcome requires a
+// genuinely positive, provider-confirmed amount and currency — if either
+// is missing, ok is false and the caller must NOT fabricate a SUCCESS
+// outcome (see the CHECK constraint on recovery_outcomes requiring
+// SUCCESS rows to carry a positive amount, which this mirrors at the
+// application layer so the failure is a clear no-op rather than a raw
+// constraint-violation error).
+//
+// For FAILED/UNKNOWN, the amount is always zero — RevGuard recovered
+// nothing — but Money still requires a valid currency, so
+// fallbackCurrency (the RecoveryCase's own RevenueAtRisk currency) is
+// used whenever the provider observation didn't carry one.
+func computeRecoveredAmount(status domain.RecoveryOutcomeStatus, amountMinorUnits int64, currency, fallbackCurrency domain.Currency) (domain.Money, bool) {
+	if currency == "" {
+		currency = fallbackCurrency
+	}
+	if status == domain.RecoveryOutcomeStatusSuccess {
+		if amountMinorUnits <= 0 {
+			return domain.Money{}, false
+		}
+		m, err := domain.NewMoney(amountMinorUnits, currency)
+		if err != nil {
+			return domain.Money{}, false
+		}
+		return m, true
+	}
+	m, err := domain.NewMoney(0, currency)
+	if err != nil {
+		return domain.Money{}, false
+	}
+	return m, true
 }

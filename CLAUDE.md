@@ -51,7 +51,11 @@ backend/            Go core backend
                             RecoveryContextBuilder, AIClient, AnalysisOrchestrator,
                             EconomicEngine, RecoveryProbabilityEstimator, ActionEconomics,
                             PolicyEngine, PolicyConfig, evaluatePolicyRules,
-                            ExecutionEngine, PaymentProvider (FakeProvider, RazorpayProvider)
+                            ExecutionEngine, PaymentProvider (FakeProvider, RazorpayProvider),
+                            WebhookProcessor, WebhookSignatureVerifier (RazorpayWebhookVerifier),
+                            ProviderEventParser (RazorpayWebhookParser), ReconciliationEngine,
+                            PaymentReconciler (FakeReconciler, RazorpayReconciler),
+                            applyFinancialOutcome (shared by WebhookProcessor/ReconciliationEngine)
   migrations/         SQL migrations (golang-migrate up/down pairs, one per table)
 ai-service/          Python FastAPI AI/ML/LLM service
   app/main.py         FastAPI app + /health + POST /v1/diagnose
@@ -65,7 +69,9 @@ docs/architecture/   architecture notes/diagrams (event-flow.md: Milestone 2 pip
                      ai-diagnosis.md: Milestone 3 AI diagnosis pipeline;
                      economic-engine.md: Milestone 4 economic evaluation pipeline;
                      policy-engine.md: Milestone 5 policy decision pipeline;
-                     execution-engine.md: Milestone 6 execution pipeline)
+                     execution-engine.md: Milestone 6 execution pipeline;
+                     webhooks-reconciliation.md: Milestone 7 webhook/reconciliation/
+                     financial-truth pipeline)
 docs/decisions/      ADRs (0001: recovery probability vs. AI confidence, and why the
                      Economic Engine doesn't decide; 0002: why AI recommendation,
                      economic evaluation, and policy authorization are three
@@ -1210,13 +1216,293 @@ automatic retry loops after an ambiguous provider response. The
 `RecoveryCase` never transitions past `VERIFYING` in every test and in
 the manual verification above.
 
-**Next milestone: Milestone 7 — Webhooks, Reconciliation & Financial
-Truth.** Not yet scoped. Do not begin implementation until explicitly
-instructed. Milestone 7 will consume Razorpay webhooks (with signature
-verification), reconcile `VERIFYING`/`UNKNOWN` `RecoveryAction`s and
-`RecoveryCase`s against actual provider-reported outcomes, and be the
-first and only place that transitions a case to a trusted, durable
-`SUCCESS` or `FAILED`.
+### Milestone 7 — Webhooks, Reconciliation & Financial Truth: COMPLETE
+
+Goal: determine the ACTUAL financial outcome of a recovery action —
+"execution succeeded" is never assumed to mean "revenue recovered."
+Consume signature-verified Razorpay webhooks, reconcile `VERIFYING`
+`RecoveryCase`s/`RecoveryAction`s against the provider's own
+authoritative state on demand, and be the first and only place that
+transitions a case to a trusted, durable `SUCCESS`, `FAILED`, or
+`UNKNOWN`. Full design rationale, flow diagrams, and the Razorpay
+honesty caveat:
+[`docs/architecture/webhooks-reconciliation.md`](./docs/architecture/webhooks-reconciliation.md).
+
+- [x] **Domain**: `ProviderWebhookEvent`
+      (`backend/internal/domain/provider_webhook_event.go`) — the durable,
+      normalized, append-only ingestion ledger for inbound webhooks (never
+      the raw request body) and the sole idempotency authority for
+      redelivery. `ProviderEventStatus` (`CAPTURED`/`FAILED`/`PENDING`) is
+      deliberately distinct from `RecoveryOutcomeStatus` — a webhook
+      observation is evidence, not itself a financial outcome.
+      `RecoveryOutcome` (`recovery_outcome.go`) gained `Provider`,
+      `Source` (`WEBHOOK`/`RECONCILIATION`), `ProviderWebhookEventID`,
+      `Metadata` — extending the Milestone 1 struct, not replacing it.
+- [x] **Database**: migration `000016` adds `provider_webhook_events`
+      (new table) with `UNIQUE(provider, provider_event_id)` — the
+      idempotency guarantee for at-least-once webhook delivery. Migration
+      `000017` extends `recovery_outcomes` (adds the four fields above),
+      a `CHECK` requiring `SUCCESS` rows to carry a positive
+      `recovered_amount_minor_units` (never a silent "recovered nothing"
+      success), and `UNIQUE(recovery_action_id)` — at most one durable
+      outcome per execution attempt. Neither migration modifies a prior
+      one.
+- [x] **`WebhookSignatureVerifier`** (`backend/internal/service/webhook_signature.go`):
+      `RazorpayWebhookVerifier` — HMAC-SHA256 of the exact raw request
+      body, hex-encoded, constant-time compared (`hmac.Equal`, avoiding a
+      timing side channel). `NewConfiguredWebhookVerifier` **fails
+      closed**: no `RAZORPAY_WEBHOOK_SECRET` configured means every
+      webhook is rejected, never silently accepted unverified.
+- [x] **`ProviderEventParser`** (`provider_event.go` interface,
+      `razorpay_webhook_parser.go` implementation): turns a
+      signature-verified raw body into a provider-agnostic
+      `ParsedProviderEvent`. Scoped to the Payment Link event lifecycle
+      Milestone 6's `RazorpayProvider` actually produces
+      (`payment_link.paid` → `CAPTURED`, `.cancelled`/`.expired` →
+      `FAILED`, anything else → `PENDING`, never guessed into a
+      definitive outcome) — not Razorpay's full webhook catalog.
+- [x] **`WebhookProcessor`** (`webhook_processor.go`, `Process(ctx,
+      rawBody, signatureHeader, eventIDHeader)`): verify → parse →
+      correlate to a `RecoveryAction` via `(provider, provider_reference)`
+      only (never a client-supplied case/action id) → idempotently
+      `TryCreate` the `ProviderWebhookEvent` row → apply the financial
+      outcome only for a matched, definitive (`CAPTURED`/`FAILED`)
+      observation. A signature or parse failure writes **nothing** to the
+      database at all.
+- [x] **`PaymentReconciler`** (`payment_reconciler.go` interface) is
+      read-only by construction — no implementation may execute a
+      payment or create a payment link. `Reconcile` returns
+      `(result, nil)` for any definitive answer including `PENDING`
+      ("not resolved yet, don't guess" — not an error), and a non-nil
+      error for anything ambiguous (timeout, transport failure), mirror-
+      ing `PaymentProvider.RetryPayment`'s error-vs-result split from
+      Milestone 6. `FakeReconciler` (`fake_reconciler.go`, six
+      deterministic scenarios) is the default, matching
+      `PAYMENT_PROVIDER`'s selection. `RazorpayReconciler`
+      (`razorpay_reconciler.go`) fetches the Payment Link resource
+      (`GET /v1/payment_links/{id}`) — **NOT VERIFIED** against a real
+      Razorpay account (see below).
+- [x] **`ReconciliationEngine`** (`reconciliation_engine.go`,
+      `Reconcile(ctx, recoveryCaseID)`): requires the case to be
+      `VERIFYING` and to have a `RecoveryAction`; an action that itself
+      already definitively `FAILED` at execution time needs no external
+      call at all (propagated directly); an action with no
+      `ProviderReference` (or a provider reporting no record of the
+      reference — `ErrReconciliationReferenceNotFound`) is a dead end for
+      automation, resolved to `UNKNOWN` once rather than left in
+      `VERIFYING` forever; otherwise the provider is asked and a
+      definitive `CAPTURED`/`FAILED` answer applies the same way a
+      webhook would.
+- [x] **`applyFinancialOutcome`** (`financial_outcome.go`): the single
+      function both `WebhookProcessor` and `ReconciliationEngine` call to
+      actually transition `VERIFYING -> {SUCCESS, FAILED, UNKNOWN}` and
+      persist the `RecoveryOutcome` — sharing it is what guarantees both
+      evidence sources reconcile through identical, once-only, monotonic
+      logic. The guarded `RecoveryCase.Status` `UPDATE ... WHERE status =
+      'VERIFYING'` is attempted **first**, before the outcome row is
+      written; PostgreSQL's row-level locking means at most one call ever
+      succeeds for a given case, and every loser is a safe, audited
+      no-op (`recovery_outcome.rejected`) — never an error, never a
+      double-counted outcome.
+- [x] **The financial outcome rule, enforced in code**:
+      `computeRecoveredAmount` never lets a `CAPTURED` observation with a
+      non-positive amount or missing currency become a `SUCCESS` outcome
+      — logged and ignored instead
+      (`webhook.ignored_insufficient_evidence` /
+      `reconciliation.ignored_insufficient_evidence`), mirroring the
+      database's own `CHECK` constraint at the application layer so the
+      failure is a clear no-op, not a raw constraint-violation 500.
+- [x] **HTTP endpoints**: `POST /v1/webhooks/razorpay`
+      (`backend/internal/http/webhook.go`) — raw body, `X-Razorpay-
+      Signature`/`X-Razorpay-Event-Id` headers, always 2xx unless the
+      request itself was unverifiable/malformed or a genuine server
+      error occurred (duplicate/unmatched are successful, not error,
+      outcomes — Razorpay's webhook delivery retries on non-2xx).
+      `POST /v1/recovery-cases/{id}/reconcile`
+      (`backend/internal/http/reconciliation.go`) — empty body, the same
+      convention Milestone 6's `/execute` established; no request field
+      lets a client assert an outcome, amount, or provider reference.
+- [x] **Config**: `RAZORPAY_WEBHOOK_SECRET` (fails closed when unset);
+      `RECONCILER_FAKE_SCENARIO`/`RECONCILER_FAKE_AMOUNT_MINOR_UNITS`/
+      `RECONCILER_FAKE_CURRENCY` configure the default `FakeReconciler`
+      (amount defaults to `0`, deliberately inert — never fabricates a
+      `SUCCESS` outcome unless explicitly configured with a positive
+      amount). `cmd/server/main.go`'s `buildPaymentReconciler` mirrors
+      `buildPaymentProvider`'s provider selection.
+- [x] Explicitly NOT implemented (by design, per milestone scope):
+      Next.js dashboard/analytics UI, ML models, Redpanda consumer
+      infrastructure, automatic/background reconciliation (no cron, no
+      retry campaign — always an explicit `POST /reconcile`, same
+      deliberate boundary as Milestone 6's `/execute`), customer
+      notification infrastructure, human approval UI, policy admin UI,
+      a new database or message broker, broad Razorpay API surface
+      beyond Payment Links, any automated resolution path out of
+      `UNKNOWN`.
+
+**Tests (all passing; unit tests need no database, integration tests are
+gated behind `TEST_DATABASE_URL`):**
+- `webhook_signature_test.go` (unit): valid signature, invalid signature,
+  tampered body, missing signature header, empty secret rejected at
+  construction, `NewConfiguredWebhookVerifier` fail-closed with no
+  secret and normal verification with one.
+- `razorpay_webhook_parser_test.go` (unit): `payment_link.paid` →
+  `CAPTURED` with correct amount/currency/reference, `.cancelled`/
+  `.expired` → `FAILED`, an unrecognized event → `PENDING`, malformed
+  JSON, missing `event` field, deterministic body-hash fallback when
+  `X-Razorpay-Event-Id` is absent, an unrecognized resource shape → empty
+  (unmatchable, not malformed) reference.
+- `fake_reconciler_test.go` (unit): all six scenarios return the correct
+  result/error shape; atomic `InvocationCount()` under 20 concurrent
+  goroutines.
+- `webhook_processor_test.go` (integration, 13 tests): invalid signature
+  never changes financial state; malformed payload and missing required
+  fields rejected; a `CAPTURED` webhook establishes `SUCCESS` with the
+  exact provider-confirmed amount/currency/source/external-reference; a
+  `.cancelled` webhook establishes `FAILED` with zero recovered amount;
+  an unrecognized event type (`PENDING`) leaves the case `VERIFYING`
+  with zero outcomes; a webhook for an unmatched/unknown resource is
+  durably recorded but has no financial effect; duplicate delivery of
+  the identical event produces exactly one outcome and one
+  `provider_webhook_events` row; a webhook arriving after the case is
+  already `SUCCESS` or already `FAILED` is a safe no-op
+  (`recovery_outcome.rejected` audited, no double-count); **5-goroutine
+  concurrent delivery of the identical event** converges on exactly one
+  applied outcome, one outcome row, one `provider_webhook_events` row,
+  and a correct total recovered amount (no double-counting); a
+  `CAPTURED` event with no definitive amount is never guessed into
+  `SUCCESS`; a dedicated no-secrets test scans persisted webhook
+  metadata for forbidden substrings and finds none.
+- `reconciliation_engine_test.go` (integration, 12 tests): a `CAPTURED`
+  reconciliation result establishes `SUCCESS` with the correct
+  amount/currency/provider/source and resolves the `UNKNOWN`
+  `RecoveryAction` to `SUCCEEDED`; a `FAILED` result establishes `FAILED`
+  ("payment link created" ≠ "revenue recovered," exercised directly); an
+  already-known execution-time `FAILED` action needs **zero** reconciler
+  invocations and still reaches `FAILED`; `PENDING` and both ambiguous
+  scenarios (timeout, transport error) leave the case `VERIFYING` with
+  zero outcomes — no fabrication; a provider reporting no record of the
+  reference resolves to `UNKNOWN`; an action with no provider reference
+  at all resolves to `UNKNOWN` with **zero** reconciler invocations; case
+  not found, case not `VERIFYING`, and no `RecoveryAction` for the case
+  are all rejected with typed errors; a second `Reconcile` call on an
+  already-resolved case is rejected (not a silent double-apply); **5-
+  goroutine concurrent reconciliation** of the identical case converges
+  on exactly one applied outcome and a consistent final `SUCCESS` status.
+- `router_test.go` updated for the two new `NewRouter` parameters.
+- Full regression: every Milestone 0–6 test still passes, `go vet` and
+  `gofmt` clean.
+
+**Verification performed:**
+- `gofmt -l .`, `go build ./...`, `go vet ./...` — clean.
+- `go test ./...` with no `TEST_DATABASE_URL` — all non-DB-gated tests
+  pass; DB-gated tests skip cleanly.
+- `TEST_DATABASE_URL=postgres://revguard:revguard@localhost:5432/revguard?sslmode=disable
+  go test ./... -v`: **157 tests pass, 0 fail**, across `internal/domain`,
+  `internal/http`, `internal/repository`, `internal/service` — every
+  Milestone 0–7 Go test; nothing regressed.
+- `go test ./... -race` (full suite, including
+  `TestWebhookProcessor_ConcurrentDuplicateDeliveryNoDoubleCount` and
+  `TestReconciliationEngine_ConcurrentReconciliationConvergesSafely`)
+  against the same database — clean, no data races reported.
+- `ai-service/`: confirmed zero git changes (`git status --short
+  ai-service/` empty) and all 36 Python tests still pass — the AI
+  service was not touched, per this milestone's scope (Milestone 7 is
+  Go-only: webhooks/reconciliation are backend concerns, no new AI
+  contract).
+- Migrations `000016` and `000017` applied cleanly on native Postgres
+  (`localhost:5432`, `revguard`/`revguard` — same fallback used since
+  Milestone 0, Docker still non-functional in this sandbox for the same
+  documented reason). Schema now at version 17.
+- **Full cross-service manual smoke test**, real (non-Docker,
+  non-mocked) `ai-service` (`AI_PROVIDER=mock`) + Go backend
+  (`PAYMENT_PROVIDER=fake`, `RAZORPAY_WEBHOOK_SECRET=smoke-test-secret`)
+  + native Postgres:
+  - Seeded a merchant/customer/payment/payment_attempt via `psql`,
+    `POST /events` reached `case_status: "ALLOW"` on the first call (the
+    established M2→M5 pipeline, unchanged), `POST /execute` reached
+    `VERIFYING` with a `fake` provider reference (the established M6
+    pipeline, unchanged).
+  - `POST /v1/webhooks/razorpay` with an intentionally wrong signature
+    returned `401` with zero state change (confirmed via `psql`: case
+    still `VERIFYING`, zero `recovery_outcomes` rows).
+  - A correctly HMAC-SHA256-signed `payment_link.paid` webhook (built
+    with a standalone Python HMAC script, not the application code, for
+    an independent signature check) returned `200` with
+    `case_status: "SUCCESS"` on the first delivery. `psql` confirmed:
+    one `recovery_outcomes` row (`status=SUCCESS`,
+    `recovered_amount_minor_units=49950`, `currency=INR`,
+    `provider=razorpay`, `source=WEBHOOK`); `recovery_cases.status =
+    SUCCESS`; a 10-event audit trail in order ending
+    `webhook.received` → `recovery_outcome.recorded` →
+    `recovery_case.transitioned` (all `ActorType=WEBHOOK` for the last
+    three).
+  - Redelivering the **identical** webhook (same `X-Razorpay-Event-Id`)
+    returned `200` with `"duplicate": true, "financial_outcome_applied":
+    false` — `psql` confirmed still exactly one `recovery_outcomes` row
+    and one `provider_webhook_events` row (no double-count).
+  - A second case was driven to `VERIFYING` and reconciled via
+    `POST /reconcile`: first against the default zero-amount
+    `FakeReconciler` — returned `"applied": false`, case remained
+    `VERIFYING` (never fabricated `SUCCESS` from a zero amount); then,
+    after restarting the backend with
+    `RECONCILER_FAKE_SCENARIO=payment_captured
+    RECONCILER_FAKE_AMOUNT_MINOR_UNITS=30000`, the identical endpoint
+    returned `"applied": true, "case_status": "SUCCESS"` — `psql`
+    confirmed one `recovery_outcomes` row
+    (`recovered_amount_minor_units=30000, source=RECONCILIATION,
+    provider=fake`) and the full 10-event audit trail including
+    `reconciliation.ignored_insufficient_evidence` (from the earlier,
+    correctly-inconclusive call) followed by `recovery_outcome.recorded`
+    and `recovery_case.transitioned`.
+  - Both backend and ai-service processes were stopped cleanly after
+    verification; no server was left running. A temporary
+    `backend/cmd/smokecheck` diagnostic (used only to trace an unrelated
+    pre-existing nullable-column scan issue in hand-seeded `psql` test
+    fixtures — not an M7 defect) was deleted immediately after use, the
+    same pattern as the `idemcheck`/`execcheck` tools from Milestones
+    4–6.
+
+**Real Razorpay verification: NOT VERIFIED.** No `RAZORPAY_KEY_ID`/
+`RAZORPAY_KEY_SECRET`/`RAZORPAY_WEBHOOK_SECRET` real credentials and no
+confirmed outbound network access to Razorpay's API exist in this
+sandbox. `RazorpayWebhookVerifier`, `RazorpayWebhookParser`, and
+`RazorpayReconciler` are written from Razorpay's long-documented,
+publicly stable webhook/Payment-Link behavior but have **not** been
+exercised against a live endpoint, a real webhook delivery, or a
+Razorpay Test Mode account. See
+[`docs/architecture/webhooks-reconciliation.md`](./docs/architecture/webhooks-reconciliation.md)
+for exactly what was and wasn't tested. Do not claim live Razorpay
+verification until it has actually been performed.
+
+**Known limitations:**
+- `RazorpayWebhookParser` only recognizes the Payment Link event
+  lifecycle, matching `RazorpayProvider`'s own Milestone 6 scope — not
+  Razorpay's full webhook catalog.
+- The `X-Razorpay-Event-Id`-header-or-body-hash idempotency key is a
+  documented assumption, not confirmed Razorpay behavior.
+- No automatic/background reconciliation exists; reaching `UNKNOWN` has
+  no further automated resolution path in this milestone — a human/ops
+  workflow to resolve it is out of scope.
+- The hand-seeded `psql` test fixtures used for manual smoke testing hit
+  two pre-existing nullable-column scan issues in the Milestone 1
+  repository layer (`payments.payment_method`,
+  `payment_attempts.failure_reason` are nullable in the schema but
+  scanned into non-nullable `*string` fields) — worked around by setting
+  those columns in the fixtures; not an M7 defect, not fixed as part of
+  this milestone (out of scope, pre-existing since Milestone 1).
+
+**Explicitly confirmed NOT implemented this milestone:** Next.js
+dashboard/analytics work, ML models, Redpanda consumer infrastructure,
+Kubernetes, Temporal, a new database or message broker, a new major
+framework, broad Razorpay API surface beyond Payment Links, customer
+notification infrastructure (WhatsApp/SMS/email), human approval UI,
+policy admin UI, automatic retry campaigns, unrelated refactoring. The
+`RecoveryCase` never transitions except via the documented
+`VERIFYING -> {SUCCESS, FAILED, UNKNOWN}` edges in every test and in the
+manual verification above.
+
+**Next milestone: Milestone 8.** Not yet scoped. Do not begin
+implementation until explicitly instructed.
 
 ## Working conventions
 

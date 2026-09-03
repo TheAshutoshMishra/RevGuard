@@ -10,9 +10,16 @@ import (
 )
 
 // NewRouter builds the chi router for the backend service. events,
-// economicEvaluations, policyDecisions, and executor may be nil in tests
-// that don't exercise the corresponding routes.
-func NewRouter(events eventProcessor, economicEvaluations economicEvaluationReader, policyDecisions policyDecisionReader, executor executionExecutor) http.Handler {
+// economicEvaluations, policyDecisions, executor, webhooks, and reconciler
+// may be nil in tests that don't exercise the corresponding routes.
+func NewRouter(
+	events eventProcessor,
+	economicEvaluations economicEvaluationReader,
+	policyDecisions policyDecisionReader,
+	executor executionExecutor,
+	webhooks webhookProcessor,
+	reconciler reconciliationEngine,
+) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.Logger)
@@ -23,6 +30,8 @@ func NewRouter(events eventProcessor, economicEvaluations economicEvaluationRead
 	r.Get("/v1/recovery-cases/{id}/economic-evaluation", handleGetEconomicEvaluation(economicEvaluations))
 	r.Get("/v1/recovery-cases/{id}/policy-decision", handleGetPolicyDecision(policyDecisions))
 	r.Post("/v1/recovery-cases/{id}/execute", handleExecuteRecoveryCase(policyDecisions, executor))
+	r.Post("/v1/webhooks/razorpay", handleRazorpayWebhook(webhooks))
+	r.Post("/v1/recovery-cases/{id}/reconcile", handleReconcileRecoveryCase(reconciler))
 
 	return r
 }

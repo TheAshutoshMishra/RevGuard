@@ -34,6 +34,20 @@ type Config struct {
 	RazorpayKeyID     string
 	RazorpayKeySecret string
 	RazorpayBaseURL   string
+
+	// RazorpayWebhookSecret authenticates inbound Razorpay webhooks (see
+	// service.NewConfiguredWebhookVerifier). Left empty, every webhook is
+	// rejected — verification never fails open.
+	RazorpayWebhookSecret string
+
+	// FakeReconcilerScenario/Amount/Currency configure the
+	// PaymentReconciler used when PaymentProvider is "fake" (see
+	// cmd/server/main.go's buildPaymentReconciler) — local/dev/test only,
+	// mirroring FakeProvider's determinism. Ignored when PaymentProvider
+	// is "razorpay".
+	FakeReconcilerScenario string
+	FakeReconcilerAmount   int64
+	FakeReconcilerCurrency string
 }
 
 // Load reads configuration from environment variables, applying sensible
@@ -60,6 +74,12 @@ func Load() Config {
 		RazorpayKeyID:     getEnv("RAZORPAY_KEY_ID", ""),
 		RazorpayKeySecret: getEnv("RAZORPAY_KEY_SECRET", ""),
 		RazorpayBaseURL:   getEnv("RAZORPAY_BASE_URL", ""),
+
+		RazorpayWebhookSecret: getEnv("RAZORPAY_WEBHOOK_SECRET", ""),
+
+		FakeReconcilerScenario: getEnv("RECONCILER_FAKE_SCENARIO", "payment_captured"),
+		FakeReconcilerAmount:   getEnvInt64("RECONCILER_FAKE_AMOUNT_MINOR_UNITS", 0),
+		FakeReconcilerCurrency: getEnv("RECONCILER_FAKE_CURRENCY", "INR"),
 	}
 }
 
@@ -90,4 +110,13 @@ func getEnvSeconds(key string, fallbackSeconds int) time.Duration {
 		}
 	}
 	return time.Duration(fallbackSeconds) * time.Second
+}
+
+func getEnvInt64(key string, fallback int64) int64 {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return fallback
 }

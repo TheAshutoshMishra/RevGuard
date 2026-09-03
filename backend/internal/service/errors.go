@@ -123,14 +123,21 @@ var (
 	// ErrNoProviderReferenceToReconcile means the RecoveryAction being
 	// reconciled has no ProviderReference — there is nothing to look up
 	// on the provider side (e.g. an execution that timed out before ever
-	// receiving a reference from the provider).
+	// receiving a reference from the provider). ReconciliationEngine
+	// treats this as a dead end for automation: rather than returning
+	// this as an error and leaving the case stuck in VERIFYING forever,
+	// it resolves the case to UNKNOWN (recorded via this error's message
+	// in the resulting audit/outcome metadata) — terminal for automation,
+	// awaiting manual review.
 	ErrNoProviderReferenceToReconcile = errors.New("service: recovery action has no provider reference to reconcile")
 
 	// ErrReconciliationReferenceNotFound means the provider reports it
 	// has no record of the given reference at all. Distinct from a
-	// transport/timeout error, but still not treated as ambiguous — it
-	// simply means reconciliation could not resolve UNKNOWN this time and
-	// the case remains unresolved.
+	// transport/timeout error (which is genuinely ambiguous and safe to
+	// retry later): a provider affirmatively reporting no record is
+	// unlikely to ever resolve differently, so ReconciliationEngine
+	// treats it the same as ErrNoProviderReferenceToReconcile — a dead
+	// end resolved to UNKNOWN, not left retriable in VERIFYING forever.
 	ErrReconciliationReferenceNotFound = errors.New("service: provider reports no record of this reference")
 
 	// ErrUnknownReconciliationProvider means a PaymentReconciler was asked
