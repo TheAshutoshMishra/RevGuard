@@ -1,0 +1,33 @@
+# --- Environment ---
+.env
+.env.*
+!.env.example
+
+# --- Go (backend) ---
+backend/bin/
+*.exe
+*.test
+*.out
+
+# --- Python (ai-service) ---
+ai-service/.venv/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# --- Node / Next.js (frontend) ---
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+frontend/*.tsbuildinfo
+npm-debug.log*
+
+# --- Editors / OS ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# --- Docker ---
+docker-compose.override.yml
