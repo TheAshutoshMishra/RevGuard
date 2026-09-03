@@ -22,8 +22,9 @@ import (
 )
 
 func main() {
-	command := flag.String("command", "up", "migration command: up, down, or version")
+	command := flag.String("command", "up", "migration command: up, down, version, or force")
 	path := flag.String("path", "migrations", "filesystem path to migration files")
+	forceVersion := flag.Int("version", 0, "target version for -command force")
 	flag.Parse()
 
 	cfg := config.Load()
@@ -46,8 +47,15 @@ func main() {
 		}
 		fmt.Printf("version=%d dirty=%v\n", version, dirty)
 		return
+	case "force":
+		// Marks the schema_migrations version clean without running any
+		// up/down SQL — for recovering from a "dirty" state after a
+		// migration failed partway (e.g. a down migration blocked by a
+		// data-dependent CHECK constraint). The caller is responsible for
+		// confirming the actual schema really does match forceVersion.
+		err = m.Force(*forceVersion)
 	default:
-		log.Fatalf("migrate: unknown command %q (want up, down, or version)", *command)
+		log.Fatalf("migrate: unknown command %q (want up, down, version, or force)", *command)
 	}
 
 	if err != nil && !errors.Is(err, migrate.ErrNoChange) {
