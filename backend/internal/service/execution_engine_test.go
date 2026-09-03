@@ -312,7 +312,7 @@ func TestExecutionEngine_PolicyDecisionBelongsToAnotherCase(t *testing.T) {
 func TestExecutionEngine_AllowWithoutAuthorizedAction(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
-	recoveryCase, _, _ := seedFullCase(t, pool,
+	recoveryCase, diagnosis, evaluation := seedFullCase(t, pool,
 		domain.FailureCategoryTransientFailure, domain.RecommendedActionRetryPayment, 0.90, 10_000, 5_000)
 	// Force the case into ALLOW directly (bypassing PolicyEngine) so we can
 	// pair it with a decision that has no AuthorizedAction — an invariant
@@ -328,7 +328,7 @@ func TestExecutionEngine_AllowWithoutAuthorizedAction(t *testing.T) {
 
 	decision := &domain.PolicyDecision{
 		ID: uuid.New(), RecoveryCaseID: recoveryCase.ID,
-		RecoveryDiagnosisID: uuid.New(), RecoveryEconomicEvaluationID: uuid.New(),
+		RecoveryDiagnosisID: diagnosis.ID, RecoveryEconomicEvaluationID: evaluation.ID,
 		Outcome: domain.PolicyDecisionOutcomeAllow, AuthorizedAction: "",
 		PolicyVersion: service.PolicyVersion, ReasonCodes: []domain.PolicyReasonCode{domain.PolicyReasonPolicyAllowed},
 		Explanation: "test", EvaluatedAt: now, CreatedAt: now,
