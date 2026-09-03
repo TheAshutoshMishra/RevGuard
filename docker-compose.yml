@@ -74,6 +74,7 @@ services:
       REDIS_PORT: 6379
       REDPANDA_BROKERS: redpanda:9092
       AI_SERVICE_URL: http://ai-service:8000
+      AI_REQUEST_TIMEOUT_SECONDS: ${AI_REQUEST_TIMEOUT_SECONDS:-20}
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     depends_on:
@@ -82,6 +83,8 @@ services:
       redis:
         condition: service_healthy
       redpanda:
+        condition: service_healthy
+      ai-service:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
