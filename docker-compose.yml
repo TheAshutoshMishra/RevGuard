@@ -93,6 +93,10 @@ services:
     build:
       context: ./ai-service
     restart: unless-stopped
+    environment:
+      AI_PROVIDER: ${AI_PROVIDER:-mock}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
     ports:
       - "8000:8000"
     healthcheck:

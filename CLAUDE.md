@@ -334,13 +334,12 @@ and pipeline diagram: [`docs/architecture/event-flow.md`](./docs/architecture/ev
     a generic `{"error":"failed to process event"}` 500 rather than
     leaking the raw Postgres error.
 
-### Milestone 3 — Next milestone: NOT STARTED
+### Milestone 3 — AI Diagnosis & Recommendation: IN PROGRESS
 
-Not yet scoped. Do not begin implementation until explicitly instructed.
-Per the product goal (not a commitment until confirmed with the user):
-AI diagnosis integration, resuming the RecoveryCase from `ANALYZING`. Do
-not call the Python AI service, implement policy decisions, or execute
-payment actions until this milestone is explicitly started.
+Goal: connect the RecoveryCase lifecycle to the Python AI service for
+structured diagnosis, resuming from `ANALYZING` and stopping at
+`ANALYZED`. AI recommends; it never authorizes, executes, or mutates
+durable state directly.
 
 ## Working conventions
 

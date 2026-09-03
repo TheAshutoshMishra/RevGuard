@@ -93,7 +93,7 @@ func countRows(t *testing.T, pool *pgxpool.Pool, query string, args ...any) int 
 func TestEventProcessor_Idempotency(t *testing.T) {
 	pool := testPool(t)
 	payment := seedPayment(t, pool)
-	processor := service.NewEventProcessor(pool, service.NewLoggingEventPublisher(nil), nil)
+	processor := service.NewEventProcessor(pool, nil, service.NewLoggingEventPublisher(nil), nil)
 
 	input := eventInputFor(payment, "payment.failed")
 
@@ -128,7 +128,7 @@ func TestEventProcessor_Idempotency(t *testing.T) {
 
 func TestEventProcessor_QualifyingEventTypesCreateCases(t *testing.T) {
 	pool := testPool(t)
-	processor := service.NewEventProcessor(pool, service.NewLoggingEventPublisher(nil), nil)
+	processor := service.NewEventProcessor(pool, nil, service.NewLoggingEventPublisher(nil), nil)
 
 	qualifying := []string{
 		"payment.failed", "checkout.abandoned", "subscription.failed",
@@ -154,7 +154,7 @@ func TestEventProcessor_QualifyingEventTypesCreateCases(t *testing.T) {
 func TestEventProcessor_NonQualifyingEventDoesNotCreateCase(t *testing.T) {
 	pool := testPool(t)
 	payment := seedPayment(t, pool)
-	processor := service.NewEventProcessor(pool, service.NewLoggingEventPublisher(nil), nil)
+	processor := service.NewEventProcessor(pool, nil, service.NewLoggingEventPublisher(nil), nil)
 
 	result, err := processor.Process(context.Background(), eventInputFor(payment, "payment.succeeded"))
 	if err != nil {
@@ -173,7 +173,7 @@ func TestEventProcessor_NonQualifyingEventDoesNotCreateCase(t *testing.T) {
 func TestEventProcessor_UnsupportedAggregateTypeRejected(t *testing.T) {
 	pool := testPool(t)
 	payment := seedPayment(t, pool)
-	processor := service.NewEventProcessor(pool, service.NewLoggingEventPublisher(nil), nil)
+	processor := service.NewEventProcessor(pool, nil, service.NewLoggingEventPublisher(nil), nil)
 
 	input := eventInputFor(payment, "payment.failed")
 	input.AggregateType = "subscription"
@@ -187,7 +187,7 @@ func TestEventProcessor_UnsupportedAggregateTypeRejected(t *testing.T) {
 func TestEventProcessor_AuditTrailRecordsCreationAndTransition(t *testing.T) {
 	pool := testPool(t)
 	payment := seedPayment(t, pool)
-	processor := service.NewEventProcessor(pool, service.NewLoggingEventPublisher(nil), nil)
+	processor := service.NewEventProcessor(pool, nil, service.NewLoggingEventPublisher(nil), nil)
 
 	result, err := processor.Process(context.Background(), eventInputFor(payment, "payment.failed"))
 	if err != nil {
@@ -212,7 +212,7 @@ func TestEventProcessor_AuditTrailRecordsCreationAndTransition(t *testing.T) {
 func TestEventProcessor_ConcurrentDuplicateEventsCreateOnlyOneCase(t *testing.T) {
 	pool := testPool(t)
 	payment := seedPayment(t, pool)
-	processor := service.NewEventProcessor(pool, service.NewLoggingEventPublisher(nil), nil)
+	processor := service.NewEventProcessor(pool, nil, service.NewLoggingEventPublisher(nil), nil)
 
 	input := eventInputFor(payment, "payment.failed")
 
@@ -265,7 +265,7 @@ func TestEventProcessor_ConcurrentDuplicateEventsCreateOnlyOneCase(t *testing.T)
 func TestEventProcessor_ConcurrentDistinctEventsSamePaymentCreateOnlyOneCase(t *testing.T) {
 	pool := testPool(t)
 	payment := seedPayment(t, pool)
-	processor := service.NewEventProcessor(pool, service.NewLoggingEventPublisher(nil), nil)
+	processor := service.NewEventProcessor(pool, nil, service.NewLoggingEventPublisher(nil), nil)
 
 	const workers = 5
 	results := make([]*service.ProcessResult, workers)

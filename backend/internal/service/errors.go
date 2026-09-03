@@ -25,4 +25,17 @@ var (
 	// ErrInvalidTransition means a requested RecoveryCase status change
 	// is not permitted by the state machine.
 	ErrInvalidTransition = errors.New("service: invalid recovery case state transition")
+
+	// ErrRecoveryCaseNotFound means a requested RecoveryCase does not exist.
+	ErrRecoveryCaseNotFound = errors.New("service: recovery case not found")
+
+	// ErrDiagnosisFailed means the AI service could not be reached, timed
+	// out, or returned a non-2xx response. This is an analysis failure,
+	// never a payment or recovery failure — see AnalyzeCase.
+	ErrDiagnosisFailed = errors.New("service: AI diagnosis request failed")
+
+	// ErrDiagnosisInvalidResponse means the AI service responded but its
+	// response failed Go's own validation (malformed JSON, out-of-range
+	// confidence, unknown action/category, missing required field).
+	ErrDiagnosisInvalidResponse = errors.New("service: AI diagnosis response is invalid")
 )

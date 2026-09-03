@@ -9,6 +9,7 @@ import (
 	"revguard/backend/internal/config"
 	revguardhttp "revguard/backend/internal/http"
 	"revguard/backend/internal/infrastructure"
+	"revguard/backend/internal/repository"
 	"revguard/backend/internal/service"
 )
 
@@ -23,7 +24,16 @@ func main() {
 	defer pool.Close()
 
 	publisher := service.NewLoggingEventPublisher(nil)
-	processor := service.NewEventProcessor(pool, publisher, nil)
+
+	aiClient := service.NewHTTPAIClient(cfg.AIServiceURL, cfg.AIRequestTimeout, nil)
+	contextBuilder := service.NewRecoveryContextBuilder(
+		repository.NewPostgresPaymentRepository(pool),
+		repository.NewPostgresPaymentAttemptRepository(pool),
+		repository.NewPostgresRecoveryActionRepository(pool),
+	)
+	analyzer := service.NewAnalysisOrchestrator(pool, contextBuilder, aiClient, nil)
+
+	processor := service.NewEventProcessor(pool, analyzer, publisher, nil)
 
 	router := revguardhttp.NewRouter(processor)
 

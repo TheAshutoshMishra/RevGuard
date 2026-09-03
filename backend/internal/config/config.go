@@ -4,6 +4,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 )
 
 // Config holds all runtime configuration for the backend service.
@@ -21,7 +23,8 @@ type Config struct {
 
 	RedpandaBrokers string
 
-	AIServiceURL string
+	AIServiceURL     string
+	AIRequestTimeout time.Duration
 }
 
 // Load reads configuration from environment variables, applying sensible
@@ -41,7 +44,8 @@ func Load() Config {
 
 		RedpandaBrokers: getEnv("REDPANDA_BROKERS", "localhost:9092"),
 
-		AIServiceURL: getEnv("AI_SERVICE_URL", "http://localhost:8000"),
+		AIServiceURL:     getEnv("AI_SERVICE_URL", "http://localhost:8000"),
+		AIRequestTimeout: getEnvSeconds("AI_REQUEST_TIMEOUT_SECONDS", 20),
 	}
 }
 
@@ -63,4 +67,13 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func getEnvSeconds(key string, fallbackSeconds int) time.Duration {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return time.Duration(fallbackSeconds) * time.Second
 }

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"revguard/backend/internal/domain"
@@ -19,26 +20,48 @@ type ProcessResult struct {
 	Duplicate    bool
 	CaseCreated  bool
 	Transitioned bool
+
+	// Diagnosis/Analyzed describe the outcome of AI analysis, attempted
+	// only when this call created a new case (CaseCreated). Analyzed is
+	// true only if the case was actually transitioned to ANALYZED by
+	// this call. AnalysisError is set (and Diagnosis/Analyzed left zero)
+	// when analysis was attempted but failed — the case remains
+	// ANALYZING; this is never treated as an event-processing failure,
+	// since the event itself was ingested successfully.
+	Diagnosis     *domain.RecoveryDiagnosis
+	Analyzed      bool
+	AnalysisError string
+}
+
+// CaseAnalyzer resumes a RecoveryCase from ANALYZING via AI diagnosis.
+// Defined at the point of use so EventProcessor can be tested without a
+// real AI client.
+type CaseAnalyzer interface {
+	AnalyzeCase(ctx context.Context, recoveryCaseID uuid.UUID, triggeringEventType string) (*AnalysisOutcome, error)
 }
 
 // EventProcessor is the entry point for event ingestion: validate,
-// deduplicate durably against PostgreSQL, persist, and correlate to a
-// RecoveryCase via the RecoveryOrchestrator. It is deliberately callable
-// independently of HTTP so a future Redpanda consumer can call it too.
+// deduplicate durably against PostgreSQL, persist, correlate to a
+// RecoveryCase via the RecoveryOrchestrator, and — for a freshly created
+// case — trigger AI analysis via the CaseAnalyzer. It is deliberately
+// callable independently of HTTP so a future Redpanda consumer can call
+// it too.
 type EventProcessor struct {
 	pool         *pgxpool.Pool
 	orchestrator *RecoveryOrchestrator
+	analyzer     CaseAnalyzer
 	publisher    EventPublisher
 	logger       *slog.Logger
 }
 
-func NewEventProcessor(pool *pgxpool.Pool, publisher EventPublisher, logger *slog.Logger) *EventProcessor {
+func NewEventProcessor(pool *pgxpool.Pool, analyzer CaseAnalyzer, publisher EventPublisher, logger *slog.Logger) *EventProcessor {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &EventProcessor{
 		pool:         pool,
 		orchestrator: NewRecoveryOrchestrator(logger),
+		analyzer:     analyzer,
 		publisher:    publisher,
 		logger:       logger,
 	}
@@ -127,10 +150,34 @@ func (p *EventProcessor) Process(ctx context.Context, input EventInput) (*Proces
 
 	caseID := outcome.Case.ID
 	event.RecoveryCaseID = &caseID
-	return &ProcessResult{
+	result := &ProcessResult{
 		Event:        event,
 		RecoveryCase: outcome.Case,
 		CaseCreated:  outcome.CaseCreated,
 		Transitioned: outcome.Transitioned,
-	}, nil
+	}
+
+	// AI analysis, like publishing, happens after commit and outside any
+	// database transaction: it's an external HTTP call to another
+	// service. Only attempt it for a freshly created case — a case that
+	// already existed is not this call's to advance (see
+	// RecoveryOrchestrator). Analysis failure does not fail event
+	// processing: the event was durably ingested and the case was
+	// durably created regardless of whether analysis succeeds.
+	if outcome.CaseCreated && p.analyzer != nil {
+		analysisOutcome, analyzeErr := p.analyzer.AnalyzeCase(ctx, outcome.Case.ID, string(event.EventType))
+		if analyzeErr != nil {
+			p.logger.Warn("AI analysis failed; recovery case remains ANALYZING",
+				"recovery_case_id", outcome.Case.ID, "error", analyzeErr)
+			result.AnalysisError = analyzeErr.Error()
+		} else {
+			result.Analyzed = analysisOutcome.Analyzed
+			result.Diagnosis = analysisOutcome.Diagnosis
+			if analysisOutcome.Case != nil {
+				result.RecoveryCase = analysisOutcome.Case
+			}
+		}
+	}
+
+	return result, nil
 }
