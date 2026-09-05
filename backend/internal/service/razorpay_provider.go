@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -80,6 +82,9 @@ type razorpayPaymentLinkRequest struct {
 	Amount      int64  `json:"amount"`
 	Currency    string `json:"currency"`
 	Description string `json:"description"`
+	// ReferenceID is NOT RevGuard's raw idempotency_key — see
+	// razorpayReferenceID's doc comment for why the two are deliberately
+	// different values.
 	ReferenceID string `json:"reference_id"`
 }
 
@@ -136,6 +141,58 @@ type razorpayLinkResult struct {
 	errorMessage      string
 }
 
+// razorpayReferenceIDPrefix tags every reference_id RevGuard sends to
+// Razorpay, so it's recognizable in the Razorpay dashboard/API as
+// RevGuard-originated without needing to reverse the hash.
+const razorpayReferenceIDPrefix = "rg_"
+
+// razorpayReferenceIDHashBytes is how many bytes of the SHA-256 digest
+// are hex-encoded into the reference_id. 16 bytes -> 32 hex chars + the
+// 3-char prefix = 35 characters — safely under Razorpay's 40-character
+// limit (see razorpayReferenceID below) while keeping the collision
+// space effectively unusable in practice (RevGuard's own idempotency
+// keys are already UUID-derived and unique).
+const razorpayReferenceIDHashBytes = 16
+
+// razorpayReferenceID derives a Razorpay-safe reference_id from
+// RevGuard's full internal idempotency key
+// (domain.RecoveryAction.IdempotencyKey, e.g.
+// "policy-decision:<policyDecisionID>" — currently 52 characters). Read
+// this before touching reference_id anywhere in this file.
+//
+// WHY THIS EXISTS: Razorpay's real Payment Links API rejects any
+// reference_id longer than 40 characters (HTTP 400 BAD_REQUEST_ERROR,
+// "reference_id: the length must be no more than 40." — confirmed
+// against a live Razorpay Test Mode account; RevGuard's own idempotency
+// key format was never checked against this limit before, since
+// RazorpayProvider had never been exercised against a real account
+// until then).
+//
+// internal idempotency_key != Razorpay reference_id: RevGuard's own
+// idempotency guarantee (the UNIQUE constraint on
+// recovery_actions.idempotency_key, and the TryCreate/resumeExisting
+// logic in execution_engine.go) is keyed entirely on the full,
+// untouched IdempotencyKey — this function's output is never stored,
+// compared, or used for any RevGuard-side lookup. It exists solely to
+// produce a value safe to hand to Razorpay as reference_id.
+//
+// Deterministic and collision-resistant by construction: SHA-256 of the
+// full idempotency key, truncated to razorpayReferenceIDHashBytes bytes,
+// hex-encoded, prefixed. The same internal key always produces the same
+// reference_id (so a retried execution attempt still presents Razorpay
+// with the identical value it would recognize as a repeat), and hashing
+// before truncating — rather than truncating the raw key string, which
+// shares the long common prefix "policy-decision:" across every action —
+// is what keeps different inputs from colliding.
+//
+// Used identically for both retry_payment and send_payment_link, since
+// both route through createPaymentLink below — one transformation, no
+// duplicated logic.
+func razorpayReferenceID(idempotencyKey string) string {
+	sum := sha256.Sum256([]byte(idempotencyKey))
+	return razorpayReferenceIDPrefix + hex.EncodeToString(sum[:razorpayReferenceIDHashBytes])
+}
+
 // createPaymentLink is the one place that actually calls Razorpay's
 // POST /v1/payment_links — both RetryPayment and SendPaymentLink use it,
 // so the HTTP/error-classification logic is never duplicated between the
@@ -145,7 +202,10 @@ func (p *RazorpayProvider) createPaymentLink(ctx context.Context, amountMinorUni
 		Amount:      amountMinorUnits,
 		Currency:    currency,
 		Description: description,
-		ReferenceID: idempotencyKey,
+		// idempotencyKey (RevGuard's full internal
+		// "policy-decision:<uuid>" key) is deliberately NOT sent as-is —
+		// see razorpayReferenceID's doc comment.
+		ReferenceID: razorpayReferenceID(idempotencyKey),
 	})
 	if err != nil {
 		return razorpayLinkResult{}, fmt.Errorf("service: marshal razorpay request: %w", err)

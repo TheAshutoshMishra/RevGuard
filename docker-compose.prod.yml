@@ -1,0 +1,125 @@
+name: revguard
+
+# Minimal production deployment: Go backend, Python AI service, Next.js
+# frontend, PostgreSQL. Deliberately omits Redis and Redpanda — per
+# CLAUDE.md's own audit (Milestone 11's system-health endpoint reports
+# both as NOT_CONFIGURED), no Go code path uses either yet
+# (LoggingEventPublisher logs events instead of publishing to a broker;
+# no idempotency/cache logic reads or writes Redis). They remain part of
+# the locked architecture for future milestones — this file is a
+# deployment convenience for the system as it exists today, not an
+# architecture change; docker-compose.yml (unchanged) is still what
+# matches the full locked architecture for local development.
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+#
+# See CLAUDE.md's "Deployment" section for the full required environment
+# variable list, migration sequence, and security checklist. Never put
+# real secret VALUES in this file or in any committed file — only
+# ${VAR:-default} references, sourced from a local, gitignored .env (or
+# your hosting platform's own secret manager) at deploy time.
+#
+# For a real managed-Postgres deployment (recommended over the
+# self-hosted `postgres` service below for anything beyond a single-VM
+# demo), set DATABASE_URL in your environment/.env — backend/internal/
+# config/config.go's PostgresDSN() prefers DATABASE_URL over the
+# individual POSTGRES_* fields when it's set, and you can then remove
+# the `postgres` service and backend's `depends_on: postgres` entry from
+# a local copy of this file.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-revguard}
+      POSTGRES_USER: ${POSTGRES_USER:-revguard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for production}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-revguard} -d ${POSTGRES_DB:-revguard}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # No host port published by default in production — only the
+    # backend (in this same compose network) needs to reach Postgres.
+    # Uncomment if you need external `psql` access from the host:
+    # ports:
+    #   - "${POSTGRES_PORT:-5432}:5432"
+
+  ai-service:
+    build:
+      context: ./ai-service
+    restart: unless-stopped
+    environment:
+      AI_PROVIDER: ${AI_PROVIDER:-mock}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # Deliberately no published host port: per the locked architecture
+    # ("AI recommends... it must never call out to infrastructure
+    # directly"), this service is only ever called by `backend` inside
+    # this compose network and should not be reachable from the public
+    # internet at all in production.
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    environment:
+      BACKEND_PORT: ${BACKEND_PORT:-8080}
+      DATABASE_URL: ${DATABASE_URL:-}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-revguard}
+      POSTGRES_USER: ${POSTGRES_USER:-revguard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for production}
+      POSTGRES_SSLMODE: ${POSTGRES_SSLMODE:-disable}
+      AI_SERVICE_URL: http://ai-service:8000
+      AI_REQUEST_TIMEOUT_SECONDS: ${AI_REQUEST_TIMEOUT_SECONDS:-20}
+      POLICY_PROFILE: ${POLICY_PROFILE:-balanced}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-fake}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_BASE_URL: ${RAZORPAY_BASE_URL:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+      RECONCILER_FAKE_SCENARIO: ${RECONCILER_FAKE_SCENARIO:-payment_captured}
+      RECONCILER_FAKE_AMOUNT_MINOR_UNITS: ${RECONCILER_FAKE_AMOUNT_MINOR_UNITS:-0}
+      RECONCILER_FAKE_CURRENCY: ${RECONCILER_FAKE_CURRENCY:-INR}
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  frontend:
+    build:
+      context: ./frontend
+      # NEXT_PUBLIC_API_URL must be a build ARG (see frontend/Dockerfile)
+      # — it is inlined into the client bundle at `next build` time, not
+      # read at container runtime. Set it to the PUBLIC URL the browser
+      # will use to reach the backend (e.g. https://api.yourdomain.com),
+      # never an internal/compose-network hostname like http://backend:8080.
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL must be set to the backend's PUBLIC URL before building}
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - backend
+
+volumes:
+  postgres-data:

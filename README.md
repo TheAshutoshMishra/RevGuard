@@ -205,3 +205,25 @@ npm run dev
 | backend    | 8080                    | Go core backend / API             |
 | ai-service | 8000                    | Python FastAPI AI/ML service      |
 | frontend   | 3000                    | Next.js UI                        |
+
+## Deployment
+
+For a minimal production deployment (Go backend + Python AI service +
+Next.js frontend + PostgreSQL — Redis/Redpanda are declared for future
+milestones but not required by any code path today), see
+**[`docker-compose.prod.yml`](./docker-compose.prod.yml)** and
+CLAUDE.md's **"Deployment"** section, which covers: required environment
+variables (names only, no values ever committed), build/startup
+commands, database migration sequence, health checks, real production
+webhook configuration, the full deployment sequence, a rollback
+procedure, and a security checklist (including one known, deliberate
+gap: no endpoint currently requires authentication — read that section
+before exposing a deployment beyond a controlled demo).
+
+Quick start once `DATABASE_URL` (or `POSTGRES_*`), `RAZORPAY_*`, and
+`NEXT_PUBLIC_API_URL` are set in your environment:
+
+```bash
+cd backend && go run ./cmd/migrate -command up && cd ..
+docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+```

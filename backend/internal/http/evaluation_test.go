@@ -13,7 +13,7 @@ func TestGetEvaluation_Defaults(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/evaluation", nil)
 	rec := httptest.NewRecorder()
 
-	NewRouter(nil, nil, nil, nil, nil, nil).ServeHTTP(rec, req)
+	NewRouter(nil, nil, nil, nil, nil, nil, nil, "").ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
@@ -35,7 +35,7 @@ func TestGetEvaluation_CustomSeedAndCases(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/evaluation?seed=42&cases=50", nil)
 	rec := httptest.NewRecorder()
 
-	NewRouter(nil, nil, nil, nil, nil, nil).ServeHTTP(rec, req)
+	NewRouter(nil, nil, nil, nil, nil, nil, nil, "").ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", rec.Code)
@@ -53,7 +53,7 @@ func TestGetEvaluation_InvalidSeedRejected(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/evaluation?seed=notanumber", nil)
 	rec := httptest.NewRecorder()
 
-	NewRouter(nil, nil, nil, nil, nil, nil).ServeHTTP(rec, req)
+	NewRouter(nil, nil, nil, nil, nil, nil, nil, "").ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d", rec.Code)
@@ -64,7 +64,7 @@ func TestGetEvaluation_CasesAboveMaxRejected(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/evaluation?cases=999999", nil)
 	rec := httptest.NewRecorder()
 
-	NewRouter(nil, nil, nil, nil, nil, nil).ServeHTTP(rec, req)
+	NewRouter(nil, nil, nil, nil, nil, nil, nil, "").ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d", rec.Code)
@@ -75,7 +75,7 @@ func TestGetEvaluation_NegativeCasesRejected(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/evaluation?cases=-1", nil)
 	rec := httptest.NewRecorder()
 
-	NewRouter(nil, nil, nil, nil, nil, nil).ServeHTTP(rec, req)
+	NewRouter(nil, nil, nil, nil, nil, nil, nil, "").ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d", rec.Code)

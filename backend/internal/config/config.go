@@ -12,11 +12,25 @@ import (
 type Config struct {
 	BackendPort string
 
+	// DatabaseURL, when set, is used as-is for the Postgres connection
+	// (the shape most managed-Postgres/PaaS providers hand you as a
+	// single value) and takes precedence over the individual
+	// Postgres*/PostgresSSLMode fields below — see PostgresDSN. Left
+	// empty (the local-development default), the individual fields
+	// build the connection string exactly as before this field existed.
+	DatabaseURL string
+
 	PostgresHost     string
 	PostgresPort     string
 	PostgresDB       string
 	PostgresUser     string
 	PostgresPassword string
+	// PostgresSSLMode is only used when DatabaseURL is unset. Defaults
+	// to "disable" to match every prior milestone's local/native-Postgres
+	// behavior unchanged; production deployments against a managed
+	// Postgres should set this to "require" (or supply a DatabaseURL
+	// whose connection string already encodes sslmode).
+	PostgresSSLMode string
 
 	RedisHost string
 	RedisPort string
@@ -64,11 +78,14 @@ func Load() Config {
 	return Config{
 		BackendPort: getEnv("BACKEND_PORT", "8080"),
 
+		DatabaseURL: getEnv("DATABASE_URL", ""),
+
 		PostgresHost:     getEnv("POSTGRES_HOST", "localhost"),
 		PostgresPort:     getEnv("POSTGRES_PORT", "5432"),
 		PostgresDB:       getEnv("POSTGRES_DB", "revguard"),
 		PostgresUser:     getEnv("POSTGRES_USER", "revguard"),
 		PostgresPassword: getEnv("POSTGRES_PASSWORD", "revguard"),
+		PostgresSSLMode:  getEnv("POSTGRES_SSLMODE", "disable"),
 
 		RedisHost: getEnv("REDIS_HOST", "localhost"),
 		RedisPort: getEnv("REDIS_PORT", "6379"),
@@ -94,10 +111,20 @@ func Load() Config {
 }
 
 // PostgresDSN builds a libpq-style connection string from the config.
+// DatabaseURL, when set, is returned unchanged (the caller is trusted to
+// have included whatever sslmode/query parameters their environment
+// needs) — this is the single-variable shape most managed-Postgres/PaaS
+// providers hand you. Otherwise the connection string is built from the
+// individual Postgres* fields, exactly as every prior milestone did,
+// with PostgresSSLMode (default "disable") now explicit instead of
+// hardcoded.
 func (c Config) PostgresDSN() string {
+	if c.DatabaseURL != "" {
+		return c.DatabaseURL
+	}
 	return fmt.Sprintf(
-		"postgres://%s:%s@%s:%s/%s?sslmode=disable",
-		c.PostgresUser, c.PostgresPassword, c.PostgresHost, c.PostgresPort, c.PostgresDB,
+		"postgres://%s:%s@%s:%s/%s?sslmode=%s",
+		c.PostgresUser, c.PostgresPassword, c.PostgresHost, c.PostgresPort, c.PostgresDB, c.PostgresSSLMode,
 	)
 }
 

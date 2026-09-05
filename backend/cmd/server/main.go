@@ -3,9 +3,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"revguard/backend/internal/config"
 	revguardhttp "revguard/backend/internal/http"
@@ -14,15 +18,26 @@ import (
 	"revguard/backend/internal/service"
 )
 
+// shutdownGracePeriod bounds how long the server waits for in-flight
+// requests to finish after receiving a shutdown signal before forcing
+// the process to exit — long enough for a real Razorpay API call
+// (execution/reconciliation) in flight to complete, short enough that a
+// deploy or restart isn't left hanging indefinitely.
+const shutdownGracePeriod = 25 * time.Second
+
 func main() {
 	cfg := config.Load()
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	pool, err := infrastructure.NewPostgresPool(ctx, cfg.PostgresDSN())
 	if err != nil {
 		log.Fatalf("failed to connect to postgres: %v", err)
 	}
-	defer pool.Close()
+	// Closed explicitly, once, at the end of main — after Shutdown has
+	// drained in-flight requests, not via defer (which would race the
+	// explicit pool.Close() call at the end of this function otherwise).
 
 	publisher := service.NewLoggingEventPublisher(nil)
 
@@ -60,14 +75,41 @@ func main() {
 	}
 	reconciliationEngine := service.NewReconciliationEngine(pool, paymentReconciler, nil)
 
-	router := revguardhttp.NewRouter(processor, economicEngine, policyEngine, executionEngine, webhookProcessor, reconciliationEngine)
+	router := revguardhttp.NewRouter(processor, economicEngine, policyEngine, executionEngine, webhookProcessor, reconciliationEngine, pool, cfg.AIServiceURL)
 
 	addr := ":" + cfg.BackendPort
-	log.Printf("revguard backend listening on %s", addr)
+	srv := &http.Server{Addr: addr, Handler: router}
 
-	if err := http.ListenAndServe(addr, router); err != nil {
-		log.Fatalf("server error: %v", err)
+	serveErr := make(chan error, 1)
+	go func() {
+		log.Printf("revguard backend listening on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+
+	// Block until either a shutdown signal (SIGINT/SIGTERM, e.g. from a
+	// container orchestrator during a deploy/restart) arrives or the
+	// server itself fails to start/serve.
+	select {
+	case <-ctx.Done():
+		log.Printf("shutdown signal received, draining in-flight requests (up to %s)", shutdownGracePeriod)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown did not complete cleanly: %v", err)
+		}
+	case err := <-serveErr:
+		if err != nil {
+			log.Fatalf("server error: %v", err)
+		}
 	}
+
+	log.Print("closing database pool")
+	pool.Close()
+	log.Print("revguard backend stopped")
 }
 
 // buildPaymentProvider selects the ExecutionEngine's PaymentProvider based
