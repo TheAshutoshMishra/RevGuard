@@ -156,6 +156,30 @@ curl http://localhost:8080/health   # backend
 curl http://localhost:8000/health   # ai-service
 open http://localhost:3000          # frontend
 ```
+or 
+Open 3 terminals:
+
+Terminal 1 — Backend
+
+cd backend
+go run ./cmd/migrate -command up
+go run ./cmd/server
+
+Terminal 2 — AI service
+
+cd ai-service
+python -m uvicorn app.main:app --reload --port 8000
+
+Terminal 3 — Frontend
+
+cd frontend
+npm run dev
+
+Then:
+
+Frontend  → http://localhost:3000
+Backend   → http://localhost:8080
+AI        → http://localhost:8000
 
 Try the pipeline end to end:
 
