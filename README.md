@@ -143,7 +143,6 @@ revguard/
 ├── scripts/           dev/ops scripts
 ├── tests/             cross-service/integration tests
 ├── docker-compose.yml
-└── CLAUDE.md          locked architecture + full milestone-by-milestone history
 ```
 
 ## Quick start (local dev)
@@ -184,7 +183,6 @@ curl http://localhost:8080/v1/recovery-cases/<id>                   # inspect th
 
 Run services individually (Go / Python / Next.js commands, and everything
 about running the synthetic evaluation harness) are documented in
-[CLAUDE.md](./CLAUDE.md).
 
 ### Services (Docker Compose)
 
@@ -199,26 +197,18 @@ about running the synthetic evaluation harness) are documented in
 
 ## Deployment
 
-See [`docker-compose.prod.yml`](./docker-compose.prod.yml) and CLAUDE.md's
+See [`docker-compose.prod.yml`](./docker-compose.prod.yml) 
 **Deployment** section for the minimal 4-process production footprint
 (backend, ai-service, frontend, PostgreSQL — Redis/Redpanda are declared for
 future milestones, not required today), required environment variables,
 health checks, webhook setup, rollback procedure, and the security
 checklist.
 
-**Known gap, read before exposing this publicly:** no endpoint currently
-requires authentication. This is a deliberate, documented placeholder, not
-an oversight — see the security checklist in CLAUDE.md before running this
-beyond a controlled demo.
-
 ## Status
 
 RevGuard has been verified end-to-end against **real Razorpay Test Mode**
 (real Payment Links, a real webhook delivered over the public internet, real
-signature verification) — see CLAUDE.md's Milestone 11 for the exact
-verification log. All financial figures in the evaluation harness are
+signature verification) —  All financial figures in the evaluation harness are
 synthetic and clearly labeled as such; nothing claims validation against
 live production data.
 
-For the full milestone-by-milestone build history, test counts, and
-verification logs, see [CLAUDE.md](./CLAUDE.md).
