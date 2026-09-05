@@ -1,118 +1,164 @@
 # RevGuard
 
-RevGuard is a revenue-protection system built around a strict separation of
-concerns:
+**RevGuard recovers failed payments — automatically, safely, and provably.**
+
+When a payment fails (insufficient funds, an expired mandate, an abandoned
+checkout), RevGuard diagnoses why, calculates whether recovering it is
+economically worth it, decides — under a fixed set of safety rules — whether
+to act automatically or hand it to a human, executes that action through a
+real payment provider, and verifies the *actual* financial outcome via
+webhooks. Every step is audited and backed by PostgreSQL as the single
+source of truth.
 
 > **AI recommends. Policy decides. Infrastructure executes. Webhooks verify.
 > Analytics proves.**
 
+That sentence is the whole design. No layer is allowed to skip ahead of the
+one before it — the AI can never authorize money movement, and nothing is
+marked "recovered" until a webhook or reconciliation call confirms it really
+was.
+
+## Why this separation exists
+
+A naive "AI decides, then acts" pipeline is exactly what you don't want
+touching revenue: a hallucinated recommendation becomes a real charge with
+no checkpoint in between. RevGuard instead treats the AI as one opinion
+among several inputs to a deterministic policy layer, which is the *only*
+thing allowed to authorize execution — see
+[`docs/decisions/0002-three-layer-separation.md`](./docs/decisions/0002-three-layer-separation.md)
+for the full reasoning.
+
 ## Architecture
 
-| Layer                    | Technology                     |
-|---------------------------|---------------------------------|
-| Core backend & authority  | Go                              |
-| AI / ML / LLM service     | Python + FastAPI                |
-| Durable source of truth   | PostgreSQL                      |
-| Idempotency / coordination / cache | Redis                  |
-| Event streaming           | Redpanda (Kafka API-compatible) |
-| Frontend                  | Next.js + TypeScript            |
-| Local development         | Docker Compose                  |
+```mermaid
+flowchart LR
+    subgraph Client
+        FE["Next.js Frontend\n(read-only dashboard)"]
+    end
 
-The Go backend is the sole authority for decisions and state changes. The
-Python AI service only produces recommendations — it never acts directly on
-infrastructure. All durable state lives in PostgreSQL; Redis is used purely
-for idempotency, coordination, and caching, never as a system of record.
+    subgraph Backend["Go Backend — sole authority for state & decisions"]
+        API["HTTP API\n(chi router)"]
+        SM["RecoveryCase state machine\nDETECTED → ANALYZING → ANALYZED →\nPOLICY_CHECK → ALLOW/BLOCK/ESCALATE →\nEXECUTING → VERIFYING → SUCCESS/FAILED/UNKNOWN"]
+        ECON["Economic Engine\n(recovery probability × value)"]
+        POLICY["Policy Engine\n(ALLOW / BLOCK / ESCALATE)"]
+        EXEC["Execution Engine\n(idempotent, provider-agnostic)"]
+        RECON["Webhook & Reconciliation\n(financial truth)"]
+    end
+
+    subgraph AI["Python AI Service — recommends only"]
+        DIAG["Diagnosis\n(FastAPI + LLM provider)"]
+    end
+
+    PG[("PostgreSQL\nsystem of record")]
+    RZP["Razorpay\n(payment execution + webhooks)"]
+
+    FE -- "GET /v1/*" --> API
+    API --> SM
+    SM --> DIAG
+    DIAG -- "recommendation only" --> SM
+    SM --> ECON --> POLICY --> EXEC
+    EXEC -- "authorized action only" --> RZP
+    RZP -- "webhook: what actually happened" --> RECON
+    RECON --> SM
+    API <--> PG
+    SM <--> PG
+```
+
+**The rule this diagram encodes:** the AI box only ever feeds a
+recommendation *into* the policy layer — it has no arrow to PostgreSQL or to
+Razorpay. Only the Execution Engine talks to the payment provider, and only
+after Policy Engine has produced an `ALLOW`. Only a webhook or a
+reconciliation call — never an execution result by itself — is allowed to
+mark an outcome as financially `SUCCESS`.
+
+### Recovery case lifecycle
+
+```
+DETECTED → ANALYZING → ANALYZED → POLICY_CHECK ─┬─ ALLOW → EXECUTING → VERIFYING ─┬─ SUCCESS
+                                                  ├─ BLOCK → CLOSED                 ├─ FAILED
+                                                  └─ ESCALATE                       └─ UNKNOWN
+```
+
+Every transition is validated against a fixed table (no ad-hoc jumps), and
+every step writes an immutable audit event.
+
+## Tech stack
+
+| Layer | Technology | Role |
+|---|---|---|
+| Core backend & authority | **Go** | owns all state, all decisions, all writes |
+| AI / ML / LLM service | **Python + FastAPI** | produces diagnoses & recommendations only |
+| Durable source of truth | **PostgreSQL** | the only system of record |
+| Idempotency / coordination / cache | **Redis** | never used as a system of record |
+| Event streaming | **Redpanda** | Kafka-API compatible, carries events between services |
+| Frontend | **Next.js + TypeScript** | read-only dashboard |
+| Local dev | **Docker Compose** | one command brings up the whole stack |
+
+## How a payment gets recovered
+
+1. **Ingest** — `POST /events` receives a `payment.failed`-type event,
+   idempotently creates/correlates a `RecoveryCase`.
+2. **Diagnose** — the AI service is asked for a structured recommendation
+   (failure category, recommended action, confidence). It never touches
+   infrastructure.
+3. **Evaluate** — the Economic Engine independently estimates recovery
+   probability and computes expected incremental value — AI confidence is
+   deliberately *not* treated as recovery probability
+   ([ADR 0001](./docs/decisions/0001-economic-engine-probability-vs-confidence.md)).
+4. **Decide** — the Policy Engine applies fixed, versioned rules (confidence
+   floor, amount ceiling, attempt limits, allowed-action list) to produce
+   `ALLOW`, `BLOCK`, or `ESCALATE`. This is the only authority for what
+   happens next.
+5. **Execute** — on `ALLOW`, `POST /execute` reloads the authorized action
+   from PostgreSQL (never a client-supplied value) and runs it through a
+   `PaymentProvider` abstraction (fake provider for tests, Razorpay Test
+   Mode for real execution).
+6. **Verify** — a signature-verified Razorpay webhook (or an on-demand
+   `POST /reconcile`) is the *only* thing that can mark the case
+   `SUCCESS`/`FAILED`/`UNKNOWN`. "Execution succeeded" is never assumed to
+   mean "revenue recovered."
+7. **Prove** — an offline, synthetic evaluation harness
+   (`go run ./cmd/evaluate`) benchmarks RevGuard's decisions against simpler
+   baselines (fixed retry, static rules) to quantify the trade-off honestly,
+   including when RevGuard loses on raw recovered revenue.
+
+Full pipeline docs, one per stage: [event ingestion](./docs/architecture/event-flow.md) ·
+[AI diagnosis](./docs/architecture/ai-diagnosis.md) ·
+[economic engine](./docs/architecture/economic-engine.md) ·
+[policy engine](./docs/architecture/policy-engine.md) ·
+[execution engine](./docs/architecture/execution-engine.md) ·
+[webhooks & reconciliation](./docs/architecture/webhooks-reconciliation.md) ·
+[evaluation harness](./docs/architecture/evaluation-engine.md)
 
 ## Repository layout
 
 ```
 revguard/
-├── backend/          # Go core backend (authority, API, domain logic)
-│   ├── cmd/server/       # main entrypoint
-│   └── internal/
-│       ├── config/       # env-based configuration
-│       ├── domain/       # domain models (empty until Milestone 1)
-│       ├── http/         # HTTP layer (chi router, handlers)
-│       ├── infrastructure/ # thin wrappers around Postgres/Redis/Redpanda
-│       └── repository/   # persistence layer (empty until Milestone 1)
-├── ai-service/       # Python FastAPI service (AI/ML/LLM recommendations)
-│   └── app/
-├── frontend/         # Next.js + TypeScript frontend
-├── deployments/       # deployment configuration (future use)
+├── backend/          Go core backend — API, domain logic, state machine, engines
+├── ai-service/        Python FastAPI — diagnosis/recommendation only, no DB access
+├── frontend/          Next.js + TypeScript — read-only dashboard
 ├── docs/
-│   ├── architecture/  # architecture notes/diagrams
-│   └── decisions/     # ADRs
-├── scripts/          # dev/ops scripts
-├── tests/            # cross-service/integration tests
+│   ├── architecture/  one doc per pipeline stage (diagrams + rationale)
+│   └── decisions/     ADRs for the non-obvious calls
+├── scripts/           dev/ops scripts
+├── tests/             cross-service/integration tests
 ├── docker-compose.yml
-├── .env.example
-└── CLAUDE.md          # locked architecture + milestone tracker
+└── CLAUDE.md          locked architecture + full milestone-by-milestone history
 ```
 
-## Milestone 0 — Foundation
-
-This milestone establishes the skeleton for every service with no business
-logic:
-
-- Go backend with a `/health` endpoint
-- Python FastAPI service with a `/health` endpoint
-- Next.js frontend skeleton
-- PostgreSQL, Redis, and Redpanda as Docker Compose services
-- Dockerfiles for backend, ai-service, and frontend
-- `.env.example` and local `.env` for configuration
-
-See [CLAUDE.md](./CLAUDE.md) for the full milestone tracker and locked
-architecture decisions.
-
-## Local development
-
-1. Copy the environment template:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-2. Start the full stack:
-
-   ```bash
-   docker compose up -d --build
-   ```
-
-3. Apply database migrations:
-
-   ```bash
-   cd backend && go run ./cmd/migrate -command up
-   ```
-
-4. Check service health:
-
-   ```bash
-   curl http://localhost:8080/health   # backend -> {"status":"ok"}
-   curl http://localhost:8000/health   # ai-service -> {"status":"ok"}
-   open http://localhost:3000          # frontend
-   ```
-
-### Running services individually
-
-**Backend (Go)**
+## Quick start (local dev)
 
 ```bash
-cd backend
-go build ./...
-go test ./...
-go run ./cmd/migrate -command up   # apply migrations (add -command down to roll back)
-go run ./cmd/server
+cp .env.example .env
+docker compose up -d --build
+cd backend && go run ./cmd/migrate -command up && cd ..
+
+curl http://localhost:8080/health   # backend
+curl http://localhost:8000/health   # ai-service
+open http://localhost:3000          # frontend
 ```
 
-The domain model lives in `backend/internal/domain` (merchants, customers,
-payments, payment attempts, recovery cases/actions/outcomes, recovery
-events, audit events) and is persisted via `backend/internal/repository`.
-Monetary amounts are always integer minor units + an explicit currency code
-(e.g. ₹499.50 → `49950`, `"INR"`) — never floating point. See
-[CLAUDE.md](./CLAUDE.md) for the full schema and rationale.
-
-Event ingestion and recovery orchestration live in `backend/internal/service`
-and are exposed via `POST /events`:
+Try the pipeline end to end:
 
 ```bash
 curl -X POST http://localhost:8080/events \
@@ -128,102 +174,51 @@ curl -X POST http://localhost:8080/events \
   }'
 ```
 
-See [docs/architecture/event-flow.md](./docs/architecture/event-flow.md) for
-the full ingestion → idempotency → recovery case → state machine → audit
-pipeline, including why PostgreSQL (not Redis) is the durable idempotency
-authority.
-
-**AI service (Python)**
+A qualifying event runs `DETECTED → ANALYZED → POLICY_CHECK → {ALLOW, BLOCK,
+ESCALATE}` in that single request. If it lands on `ALLOW`:
 
 ```bash
-cd ai-service
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+curl -X POST http://localhost:8080/v1/recovery-cases/<id>/execute   # empty body
+curl http://localhost:8080/v1/recovery-cases/<id>                   # inspect the case
 ```
 
-When a `RecoveryCase` reaches `ANALYZING`, the backend calls the AI
-service's `POST /v1/diagnose` for a structured diagnosis and
-recommendation, then moves the case to `ANALYZED`. The AI service only
-ever recommends — it never authorizes or executes anything. Defaults to a
-deterministic mock provider (`AI_PROVIDER=mock`, no credentials needed);
-set `AI_PROVIDER=anthropic` and `ANTHROPIC_API_KEY` for real model calls.
-See [docs/architecture/ai-diagnosis.md](./docs/architecture/ai-diagnosis.md)
-for the full contract.
+Run services individually (Go / Python / Next.js commands, and everything
+about running the synthetic evaluation harness) are documented in
+[CLAUDE.md](./CLAUDE.md).
 
-Once a case reaches `ANALYZED`, the backend deterministically evaluates
-whether the recommendation has positive expected economic value —
-revenue at risk, estimated recovery probability, expected gross recovery,
-action cost, risk cost, and expected incremental value — and stores the
-result. This never changes the case's status or decides anything; it's
-pure evaluation. Read it back via
-`GET /v1/recovery-cases/{id}/economic-evaluation`. See
-[docs/architecture/economic-engine.md](./docs/architecture/economic-engine.md)
-for the full model, including why AI confidence is not recovery
-probability.
+### Services (Docker Compose)
 
-The backend then deterministically decides whether the recommendation is
-authorized to proceed: `ALLOW`, `BLOCK`, or `ESCALATE`, based on a fixed,
-versioned set of rules (confidence, economic value, amount, attempt
-history, and which actions are allowed to run automatically at all) —
-never on AI confidence or a positive economic value alone. This is the
-final authority before execution (a future milestone); nothing is
-executed here. Read it back via
-`GET /v1/recovery-cases/{id}/policy-decision`. See
-[docs/architecture/policy-engine.md](./docs/architecture/policy-engine.md)
-for the full rule set.
-
-When a case is `ALLOW`, `POST /v1/recovery-cases/{id}/execute` (empty
-body — the client never supplies an action) triggers a bounded execution
-attempt: the backend reloads the case's authoritative `PolicyDecision`
-server-side, executes only its `AuthorizedAction` via a `PaymentProvider`
-abstraction (a deterministic fake provider by default, or a minimal,
-honestly-scoped Razorpay Payment Links adapter via
-`PAYMENT_PROVIDER=razorpay`), and moves the case
-`ALLOW -> EXECUTING -> VERIFYING`. An ambiguous provider result (timeout,
-transport error) is recorded as `UNKNOWN`, never guessed into
-`SUCCESS`/`FAILED`. See
-[docs/architecture/execution-engine.md](./docs/architecture/execution-engine.md)
-for the full idempotency, concurrency, and timeout-safety design.
-
-**Frontend (Next.js)**
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-## Services (Docker Compose)
-
-| Service    | Port(s)                | Purpose                          |
-|------------|-------------------------|-----------------------------------|
-| postgres   | 5432                    | durable source of truth           |
-| redis      | 6379                    | idempotency / coordination / cache |
-| redpanda   | 9092, 8081, 8082, 9644  | event streaming (Kafka API)        |
-| backend    | 8080                    | Go core backend / API             |
-| ai-service | 8000                    | Python FastAPI AI/ML service      |
-| frontend   | 3000                    | Next.js UI                        |
+| Service    | Port(s)                | Purpose                             |
+|------------|-------------------------|--------------------------------------|
+| postgres   | 5432                    | durable source of truth              |
+| redis      | 6379                    | idempotency / coordination / cache   |
+| redpanda   | 9092, 8081, 8082, 9644  | event streaming (Kafka API)          |
+| backend    | 8080                    | Go core backend / API                |
+| ai-service | 8000                    | Python FastAPI AI/ML service         |
+| frontend   | 3000                    | Next.js dashboard                    |
 
 ## Deployment
 
-For a minimal production deployment (Go backend + Python AI service +
-Next.js frontend + PostgreSQL — Redis/Redpanda are declared for future
-milestones but not required by any code path today), see
-**[`docker-compose.prod.yml`](./docker-compose.prod.yml)** and
-CLAUDE.md's **"Deployment"** section, which covers: required environment
-variables (names only, no values ever committed), build/startup
-commands, database migration sequence, health checks, real production
-webhook configuration, the full deployment sequence, a rollback
-procedure, and a security checklist (including one known, deliberate
-gap: no endpoint currently requires authentication — read that section
-before exposing a deployment beyond a controlled demo).
+See [`docker-compose.prod.yml`](./docker-compose.prod.yml) and CLAUDE.md's
+**Deployment** section for the minimal 4-process production footprint
+(backend, ai-service, frontend, PostgreSQL — Redis/Redpanda are declared for
+future milestones, not required today), required environment variables,
+health checks, webhook setup, rollback procedure, and the security
+checklist.
 
-Quick start once `DATABASE_URL` (or `POSTGRES_*`), `RAZORPAY_*`, and
-`NEXT_PUBLIC_API_URL` are set in your environment:
+**Known gap, read before exposing this publicly:** no endpoint currently
+requires authentication. This is a deliberate, documented placeholder, not
+an oversight — see the security checklist in CLAUDE.md before running this
+beyond a controlled demo.
 
-```bash
-cd backend && go run ./cmd/migrate -command up && cd ..
-docker compose -f docker-compose.prod.yml --env-file .env up -d --build
-```
+## Status
+
+RevGuard has been verified end-to-end against **real Razorpay Test Mode**
+(real Payment Links, a real webhook delivered over the public internet, real
+signature verification) — see CLAUDE.md's Milestone 11 for the exact
+verification log. All financial figures in the evaluation harness are
+synthetic and clearly labeled as such; nothing claims validation against
+live production data.
+
+For the full milestone-by-milestone build history, test counts, and
+verification logs, see [CLAUDE.md](./CLAUDE.md).
